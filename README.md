@@ -127,6 +127,41 @@ node cli.ts backup data/app.db snap.db  # APFS clone 时点快照（≈0 秒）
 node cli.ts serve data/app.db           # stdio NDJSON 协议，给 macOS 客户端用
 ```
 
+业务表走另一组命令（走页表 + 位图，不是 KV）：
+
+```bash
+node cli.ts biz-put   data/app.db u_1 '{"name":"张远","dept":"R&D","level":7}'
+node cli.ts biz-get   data/app.db u_1
+node cli.ts biz-del   data/app.db u_1
+node cli.ts biz-query data/app.db --filter '{"eq":{"dept":"R&D"},"gte":{"level":5}}' --limit 20
+node cli.ts biz-stats data/app.db        # 页数 / 行数 / 位图数 / 占用
+```
+
+`--filter` 就是 `Filter` 的 JSON：`{eq: {字段: 值 | 值数组}, gte: {数值字段: n}, lte: {...}, limit, after}`。
+
+想先看点东西：`npm run demo` 生成 `data/demo.db`（3000 行业务 + 2000 条抓包 + 20 个 agent body，
+1.6 秒），然后 `node cli.ts serve data/demo.db` 丢给客户端。
+
+## stdio 协议
+
+一行一个请求、一行一个响应，用自增 `id` 对号。启动先发一条 `{hello: {pid, crc, stats}}`。
+
+| op | 参数 | 返回 |
+|---|---|---|
+| `info` / `check` | — | 库统计 / 自检报告 |
+| `list` | `ns`, `limit`, `after` | 记录数组 |
+| `get` | `ns`, `key` | `{value, body, seg, ts}` |
+| `body` | `ns`, `key` | `{base64, len}`（演示用；大 body 别走这条） |
+| `put` | `ns`, `key`, `value` | `{seq}` |
+| `putbody` | `ns`, `key`, `base64`, `meta` | `{seq, loc}` |
+| `clear` | `ns` | `{freedBytes, deadSegs, truncated}` |
+| `biz.info` | — | `{pages, index}` |
+| `biz.query` | `filter`, `limit` | `{matched, took_us, rows:[{key, rowid, value}]}` |
+| `biz.get` / `biz.put` / `biz.del` / `biz.clear` | `key`, `value` | 同上对应语义 |
+| `backup` / `quit` | `value`(目标路径) / — | — |
+
+出错一律 `{id, ok: false, error}`，未知 op 也不会把进程带死。
+
 ```ts
 import { Store } from './src/store.ts';
 
@@ -207,8 +242,9 @@ node bench/biz.ts --rows 30000
 
 - Node **≥ 22.18**（能直接跑 `.ts` 的类型擦除；更早版本需要先 `tsc` 编译，且没有 `zlib.crc32`）
 - 类型检查：`npm run typecheck`（TypeScript 7）
-- 测试：`npm test` → **79 个用例**（约 55 秒）
-  - `bitmap` 16 / `pagetable` 24 / `biz` 9 / `core` 23 / `store` 7
+- 测试：`npm test` → **83 个用例**（约 55 秒）
+  - `bitmap` 16 / `pagetable` 24 / `biz` 9 / `core` 23 / `protocol` 4 / `store` 7
+  - `protocol` 是真的 spawn 一个 `cli.ts serve` 走管道，锁住 macOS 客户端依赖的那套协议
   - `core` 是「快速分支覆盖」，全程批量提交，5 秒跑完，专门喂给变异测试；
     `store` 是「长流程规模验证」（跨段 500 条、清空 200 条），慢但只跑一次
 - 变异测试：`npm run mutate:all`

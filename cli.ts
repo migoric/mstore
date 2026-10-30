@@ -11,6 +11,7 @@ import { crc32Impl } from './src/crc32.ts';
 import { cloneFile } from './src/io.ts';
 import { NS_NAME } from './src/format.ts';
 import type { NsName } from './src/types.ts';
+import type { Filter } from './src/bizindex.ts';
 
 const MB = 1024 * 1024;
 
@@ -28,6 +29,12 @@ function usage(): void {
   mstore cat <file.db> <ns> <key>            body 原样输出（stdout）
   mstore export <file.db> <dir>              全库导出为 NDJSON 文件
   mstore backup <file.db> <dst.db>           APFS clone 时点快照
+  mstore biz-put <file.db> <key> <json>      写一行业务数据（CoW 页表 + 位图）
+  mstore biz-get <file.db> <key>             读一行业务数据
+  mstore biz-del <file.db> <key>             删一行业务数据
+  mstore biz-query <file.db> [--filter JSON] [--limit N]
+                                             位图查询，filter 形如 {"eq":{"dept":"R&D"}}
+  mstore biz-stats <file.db>                 页表 / 位图索引统计
   mstore clear <file.db> <ns>                清空一个 ns（标记段组 dead）
   mstore reclaim <file.db>                   回收 pending 段（需 MSTORE_PUNCH_HELPER）
   mstore serve <file.db>                     stdio NDJSON 协议（给 macOS 客户端用）
@@ -197,6 +204,64 @@ async function main(): Promise<void> {
       return;
     }
 
+    case 'biz-put': {
+      const [, file, key, json] = argv;
+      if (!file || !key) return usage();
+      const db = openStore(file);
+      const r = await db.bizPut(key, json ? JSON.parse(json) : null);
+      await db.close();
+      console.log(`ok seq=${r.seq} rowid=${r.rowid}`);
+      return;
+    }
+
+    case 'biz-get': {
+      const [, file, key] = argv;
+      const db = openStore(file!);
+      const v = db.bizGet(key!);
+      await db.close();
+      console.log(v === undefined ? 'null' : JSON.stringify(v));
+      return;
+    }
+
+    case 'biz-del': {
+      const [, file, key] = argv;
+      const db = openStore(file!);
+      const r = await db.bizDel(key!);
+      await db.close();
+      console.log(`ok seq=${r.seq} removed=${r.removed}`);
+      return;
+    }
+
+    case 'biz-query': {
+      const [, file] = argv;
+      const db = openStore(file!);
+      const raw = argAfter(argv, '--filter', '{}')!;
+      const filter = JSON.parse(raw) as Filter;
+      const limit = Number(argAfter(argv, '--limit', '50'));
+      const t0 = performance.now();
+      const { keys, rowids } = db.bizQuery(filter);
+      const took = performance.now() - t0;
+      const page = keys.slice(0, limit);
+      if (argv.includes('--json')) {
+        console.log(JSON.stringify({ took_us: +(took * 1000).toFixed(1), matched: keys.length, rows: page.map((k) => ({ key: k, value: db.bizGet(k) })) }, null, 2));
+      } else {
+        console.error(`# 命中 ${keys.length} 条，用时 ${(took * 1000).toFixed(1)}µs，显示前 ${page.length} 条`);
+        for (const k of page) console.log(`${k}\t${JSON.stringify(db.bizGet(k))}`);
+      }
+      void rowids;
+      await db.close();
+      return;
+    }
+
+    case 'biz-stats': {
+      const db = openStore(argv[1] ?? '');
+      const s = db.bizStats();
+      await db.close();
+      console.log(`pages       ${s.pages.pages} 行=${s.pages.rows} 页大小=${s.pages.pageSize} 重写=${s.pages.rewrites} 占用=${(s.pages.bytes / MB).toFixed(2)}MB`);
+      console.log(`index       ${JSON.stringify(s.index)}`);
+      return;
+    }
+
     case 'reclaim': {
       const db = openStore(argv[1] ?? '');
       const r = db.reclaim();
@@ -224,7 +289,19 @@ async function serve(db: Store): Promise<void> {
 
   for await (const line of rl) {
     if (!line.trim()) continue;
-    let req: { id?: number; op: string; ns?: NsName; key?: string; value?: unknown; limit?: number; after?: string };
+    let req: {
+      id?: number;
+      op: string;
+      ns?: NsName;
+      key?: string;
+      value?: unknown;
+      limit?: number;
+      after?: string;
+      filter?: Filter;
+      /** putbody 用：body 走 base64，元信息另放 */
+      base64?: string;
+      meta?: unknown;
+    };
     try {
       req = JSON.parse(line);
     } catch {
@@ -255,9 +332,53 @@ async function serve(db: Store): Promise<void> {
           send({ id, ok: true, result: r });
           break;
         }
+        case 'putbody': {
+          const bytes = Buffer.from(req.base64 ?? '', 'base64');
+          const r = await db.putBody(req.ns as NsName, req.key!, bytes, req.meta ?? null);
+          send({ id, ok: true, result: r });
+          break;
+        }
         case 'check':
           send({ id, ok: true, result: db.check() });
           break;
+        case 'biz.info':
+          send({ id, ok: true, result: db.bizStats() });
+          break;
+        case 'biz.query': {
+          const t0 = performance.now();
+          const { keys, rowids } = db.bizQuery(req.filter ?? {});
+          const took = performance.now() - t0;
+          const limit = req.limit ?? 200;
+          const page = keys.slice(0, limit);
+          send({
+            id,
+            ok: true,
+            result: {
+              took_us: +(took * 1000).toFixed(1),
+              matched: keys.length,
+              rows: page.map((k, i) => ({ key: k, rowid: rowids[i], value: db.bizGet(k) })),
+            },
+          });
+          break;
+        }
+        case 'biz.get':
+          send({ id, ok: true, result: { value: db.bizGet(req.key!) ?? null } });
+          break;
+        case 'biz.put': {
+          const r = await db.bizPut(req.key!, req.value);
+          send({ id, ok: true, result: r });
+          break;
+        }
+        case 'biz.del': {
+          const r = await db.bizDel(req.key!);
+          send({ id, ok: true, result: r });
+          break;
+        }
+        case 'biz.clear': {
+          const r = await db.bizClear();
+          send({ id, ok: true, result: r });
+          break;
+        }
         case 'clear': {
           const r = await db.clearNs(req.ns as NsName);
           send({ id, ok: true, result: r });
