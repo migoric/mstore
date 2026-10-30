@@ -665,7 +665,8 @@ export class Store {
       at: Date.now(),
     };
     this.meta.snap = snap;
-    this.metaDirty = true;
+    // 注意：_registerSeg 已经把 metaDirty 置 true（段表变了），下面这行是防御性冗余。
+    this.metaDirty = true; // equiv: 冗余赋值——flush() 无条件写 meta，_flushNow 又被 _registerSeg 兜住，公开 API 上观察不到差异
     return true;
   }
 
@@ -676,7 +677,8 @@ export class Store {
     const seg = this.segById.get(snap.seg);
     if (seg) seg.live = false;
     this.meta.snap = undefined;
-    this.metaDirty = true;
+    // 两处调用点都不依赖它：一处紧接着就 _registerSeg（已标脏），一处是空库提前返回（随后必然 flush）。
+    this.metaDirty = true; // equiv: 同上，冗余赋值；flush 无条件写 meta，空库路径也能落盘
     this._reclaimTail();
   }
 

@@ -343,7 +343,7 @@ export class PageTable {
   ): void {
     this.dir = dir.slice();
     this.index.clear();
-    for (let i = 0; i < keys.length; i++) {
+    for (let i = 0; i < keys.length; i++) { // equiv: 改成 <= 时 keys[length] 是 undefined，被下面那行 continue 掉
       const k = keys[i];
       if (k === undefined) continue;
       this.index.set(k, logicals[i]!);
@@ -353,7 +353,7 @@ export class PageTable {
     this.openLogical = null;
     this.openRows = [];
     this.openBytes = 0;
-    this.openDirty = false;
+    this.openDirty = false; // equiv: openLogical 已经置 null，flushOpen 会先返回，脏标记无人读
   }
 }
 

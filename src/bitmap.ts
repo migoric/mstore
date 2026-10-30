@@ -126,6 +126,36 @@ export class Bitmap {
     }
   }
 
+  /**
+   * 只遍历 [from, to) 内的置位。给「按块剪枝」用：算出一批可能命中的行区间，
+   * 只在这些区间里吐 rowid，区间外整段跳过。
+   *
+   * 两个端点所在字要掐掉范围外的位——`-1 << (from & 31)` 在 from 对齐到 32 时
+   * 正好是 0xFFFFFFFF（不移位），所以首字不需要特判；末字要特判，因为
+   * `1 << 32` 在 JS 里等于 `1 << 0`，会留下不该留的位。
+   */
+  forEachWhileRange(from: number, to: number, cb: (i: number) => boolean): void {
+    const limit = Math.min(to, this.capacity);  // equiv: 调用方保证 to <= capacity
+    if (from >= limit) return; // equiv: from === limit 时下面首末字掩码相与正好为 0，吐不出任何位
+    const w0 = from >>> 5;
+    const w1 = (limit - 1) >>> 5;
+    for (let w = w0; w <= w1 && w < this.words.length; w++) {
+      let x = this.words[w]! | 0;
+      if (w === w0) x &= -1 << (from & 31);
+      if (w === w1) {
+        const tail = limit & 31;
+        x &= tail === 0 ? -1 : (1 << tail) - 1;
+      }
+      while (x !== 0) {
+        const lowest = x & -x;
+        const bit = 31 - Math.clz32(lowest);
+        const i = (w << 5) + bit;
+        x ^= lowest;
+        if (cb(i) === false) return;
+      }
+    }
+  }
+
   toArray(): number[] {
     const out: number[] = [];
     this.forEach((i) => out.push(i));

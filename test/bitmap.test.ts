@@ -181,3 +181,80 @@ test('capacity 小于 words*32 时，超出的位不应被吐出', () => {
   });
   assert.deepEqual(seen, [0, 1, 2, 3, 4], '超出 capacity 的位必须被过滤');
 });
+
+// ---------------- forEachWhileRange（区间剪枝的底座） ----------------
+
+const collectRange = (bm: Bitmap, from: number, to: number): number[] => {
+  const out: number[] = [];
+  bm.forEachWhileRange(from, to, (i) => {
+    out.push(i);
+    return true;
+  });
+  return out;
+};
+
+test('forEachWhileRange：只吐 [from, to) 内的位', () => {
+  const bm = new Bitmap(200);
+  for (let i = 0; i < 200; i += 3) bm.set(i);
+  const all = bm.toArray();
+  assert.deepEqual(collectRange(bm, 0, 200), all);
+  assert.deepEqual(collectRange(bm, 30, 60), all.filter((i) => i >= 30 && i < 60));
+  assert.deepEqual(collectRange(bm, 31, 33), all.filter((i) => i >= 31 && i < 33));
+});
+
+test('forEachWhileRange：端点正好对齐 32 的边界', () => {
+  const bm = new Bitmap(256);
+  for (let i = 0; i < 256; i++) bm.set(i);
+  // from 对齐：`-1 << 0` 是 0xFFFFFFFF，不能把整个字抹掉
+  assert.deepEqual(collectRange(bm, 32, 96), Array.from({ length: 64 }, (_, k) => 32 + k));
+  assert.deepEqual(collectRange(bm, 0, 32), Array.from({ length: 32 }, (_, k) => k));
+  // to 对齐：`1 << 32` 在 JS 里等于 1，必须特判
+  assert.deepEqual(collectRange(bm, 224, 256), Array.from({ length: 32 }, (_, k) => 224 + k));
+  assert.deepEqual(collectRange(bm, 64, 64), []);
+});
+
+test('forEachWhileRange：分段遍历拼起来 ≡ 全量遍历', () => {
+  const bm = new Bitmap(1000);
+  let seed = 7;
+  for (let i = 0; i < 1000; i++) {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    if (seed % 3 === 0) bm.set(i);
+  }
+  const all = bm.toArray();
+  // 用不规则的段长切，专门制造非对齐边界
+  const pieces: number[] = [];
+  let at = 0;
+  let step = 17;
+  while (at < 1000) {
+    const to = Math.min(1000, at + step);
+    pieces.push(...collectRange(bm, at, to));
+    at = to;
+    step = (step * 3 + 5) % 97 || 1;
+  }
+  assert.deepEqual(pieces, all);
+});
+
+test('forEachWhileRange：to 超过 capacity 时按 capacity 截断', () => {
+  const bm = new Bitmap(10);
+  for (let i = 0; i < 10; i++) bm.set(i);
+  assert.deepEqual(collectRange(bm, 0, 999), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+  assert.deepEqual(collectRange(bm, 8, 999), [8, 9]);
+});
+
+test('forEachWhileRange：cb 返回 false 立刻停下', () => {
+  const bm = new Bitmap(500);
+  for (let i = 0; i < 500; i++) bm.set(i);
+  const seen: number[] = [];
+  bm.forEachWhileRange(100, 400, (i) => {
+    seen.push(i);
+    return i < 103;
+  });
+  assert.deepEqual(seen, [100, 101, 102, 103]);
+});
+
+test('forEachWhileRange：空位图 / 越界区间都是安全空操作', () => {
+  const bm = new Bitmap(64);
+  assert.deepEqual(collectRange(bm, 0, 64), []);
+  assert.deepEqual(collectRange(bm, 999, 1000), []);
+  assert.deepEqual(collectRange(bm, 10, 5), []);
+});

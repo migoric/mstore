@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Store } from '../src/store.ts';
+import { crc32 } from '../src/crc32.ts';
 import * as F from '../src/format.ts';
 import type { Filter } from '../src/bizindex.ts';
 import type { Meta } from '../src/types.ts';
@@ -109,6 +110,45 @@ test('快照命中：open 走 snapshot，查询结果与重放逐字节相同', 
   assert.ok(snapRows > 0);
 });
 
+test('stats 里的 snap 段计数只算快照段，不与 shell / body 混算', async () => {
+  const f = file();
+  await seed(f, 80);
+  const db = Store.open(f);
+  const s = db.stats();
+  assert.equal(db.openPath, 'snapshot');
+  assert.equal(s.segs.snapshot, 1, `应该正好有一个快照段：${JSON.stringify(s.segs)}`);
+  await db.close();
+});
+
+test('快照结构坏但 CRC 对得上：拒绝并清空半成品，回退重放', async () => {
+  const f = file();
+  await seed(f, 120);
+  const snap = metaOnDisk(f).snap!;
+
+  // 把 magic 抹掉，并同步更新 meta 里的 CRC——这样会越过 CRC 校验那一关，
+  // 真正走到 decodeSnapshot 抛错的分支。这是最容易留下半成品索引的路径：
+  // 解码是边读边填的，抛错时内存里可能已经填了一半。
+  const fd = fs.openSync(f, 'r+');
+  const buf = Buffer.alloc(snap.len);
+  fs.readSync(fd, buf, 0, snap.len, snap.off);
+  buf.write('XXXX', 0, 'latin1');
+  fs.writeSync(fd, buf, 0, buf.length, snap.off);
+  fs.closeSync(fd);
+
+  const db = Store.open(f, { snapshot: false });
+  db.meta.snap!.crc = crc32(buf);
+  await db.flush();
+  await db.close();
+
+  const r = Store.open(f);
+  assert.equal(r.openPath, 'replay');
+  assert.match(r.openNote, /rejected/);
+  // 半成品必须被清干净：行数、查询结果都要和原始数据一致
+  assert.equal(r.bizStats().pages.rows, 120);
+  assert.equal(r.bizQuery({ gte: { level: 0 } }).keys.length, 120);
+  await r.close();
+});
+
 test('快照写完之后段表里只留一份，旧的被回收掉', async () => {
   const f = file();
   const db = Store.create(f);
@@ -187,6 +227,15 @@ test('快照段被标死：回退重放，不炸也不读空', async () => {
   const snapSeg = db.meta.snap!.seg;
   const seg = db.meta.segs.find((s) => s.id === snapSeg)!;
   seg.live = false;
+
+  // 自检必须把「快照指向一个死段」明确报出来。不报的话，性能回退（下次走重放）
+  // 在线上会完全没有线索——只是「变慢了」。
+  const c = db.check();
+  assert.ok(
+    c.issues.some((x) => x.level === 'error' && /missing\/dead/.test(x.detail)),
+    `自检应报出快照指向死段，实际 issues=${JSON.stringify(c.issues)}`
+  );
+
   await db.flush();
   await db.close();
 
@@ -215,6 +264,43 @@ test('meta 里的快照长度被改小：明确拒绝，不半信半疑地恢复
   assert.equal(r.bizStats().pages.rows, 150);
   await r.close();
   assert.ok(snap.len > 64);
+});
+
+test('meta 里的快照长度被改大到越过文件尾：读不出来就拒绝，不留半截索引', async () => {
+  const f = file();
+  await seed(f, 150);
+
+  // 「读出来了但校验不过」和「根本读不出来」是两条不同的岔路：
+  // 前者靠 CRC 挡，后者靠 readAt 精确读满的语义挡（少读一个字节就抛错）。
+  // 只测前面那条，后面那条把 return false 改成 true 也不会红。
+  const db = Store.open(f, { snapshot: false });
+  db.meta.snap!.len = 1 << 24;
+  await db.flush();
+  await db.close();
+
+  const r = Store.open(f);
+  assert.equal(r.openPath, 'replay');
+  assert.match(r.openNote, /truncated/);
+  assert.equal(r.bizStats().pages.rows, 150, '回退重放必须把 150 行一行不少地装回来');
+  assert.equal(r.bizGet('u_0') !== undefined, true, '回退之后数据要真的能读');
+  await r.close();
+});
+
+test('关掉快照时 writeSnapshot 明确返回 false，不偷偷写一份', async () => {
+  const f = file();
+  const db = Store.create(f, { snapshot: false });
+  await putRows(db, Array.from({ length: 20 }, (_, i) => `u_${i}`), (_k, i) => row(i));
+
+  // 返回值是调用方能看见的唯一信号：真有一天 sync 循环按它决定「还要不要再试」，
+  // 关掉快照却回 true 会让它白转一圈
+  assert.equal(db.writeSnapshot(), false);
+  assert.equal(db.meta.snap, undefined, '关掉快照就不该留下指针');
+  await db.close();
+
+  const r = Store.open(f, { snapshot: false });
+  assert.equal(r.openPath, 'replay');
+  assert.equal(r.bizStats().pages.rows, 20);
+  await r.close();
 });
 
 test('删除行之后重开：删掉的不复活，新行的 rowid 不跟老行撞号', async () => {
@@ -272,6 +358,7 @@ test('空库不写快照：不浪费一个段', async () => {
   const f = file();
   const db = Store.create(f);
   await db.put('mock', 'a', 1); // 只写 KV，业务表还是空的
+  assert.equal(db.writeSnapshot(), false, '空库不该写快照，必须明确返回 false');
   await db.close();
   assert.equal(metaOnDisk(f).snap, undefined);
 

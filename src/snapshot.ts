@@ -35,7 +35,12 @@ import type { BizIndex } from './bizindex.ts';
 import type { PageTable } from './pagetable.ts';
 
 export const SNAP_MAGIC = Buffer.from('MSNP', 'latin1');
-export const SNAP_VER = 1;
+/**
+ * 2 = 数值块追加了块级 min/max 统计（区间查询剪枝用）。
+ * 升版本而不是做兼容读：版本不符就整份拒绝、回退重放，旧库只是慢一次，
+ * 绝不会拿错位的数据去恢复索引。
+ */
+export const SNAP_VER = 2;
 
 const TAG = {
   DIR: 1,
@@ -285,6 +290,11 @@ export function encodeSnapshot(pages: PageTable, biz: BizIndex): Buffer {
     w.str(col.field);
     w.u32(col.data.length);
     w.f64Array(col.data);
+    // 块统计跟数值列一起存：不存的话恢复后要 O(n) 重建一遍，
+    // 而且「快照打开」与「重放打开」的查询性能会不一致——那是最难查的一类问题。
+    w.u32(col.bmin.length);
+    w.f64Array(col.bmin);
+    w.f64Array(col.bmax);
   }
   w.endBlock(at);
 
@@ -338,7 +348,7 @@ export function decodeSnapshot(buf: Buffer, pages: PageTable, biz: BizIndex): Sn
   let rowLogicals: number[] = [];
   const loose: Array<[string, number]> = [];
   let enumCols: Array<{ field: string; values: Array<{ value: string; bitmap: Bitmap }> }> = [];
-  let numCols: Array<{ field: string; data: Float64Array }> = [];
+  let numCols: Array<{ field: string; data: Float64Array; bmin: Float64Array; bmax: Float64Array }> = [];
   let alive: Bitmap | null = null;
   let state: { nextRowid: number; liveCount: number; capacity: number } | null = null;
 
@@ -397,7 +407,9 @@ export function decodeSnapshot(buf: Buffer, pages: PageTable, biz: BizIndex): Sn
         for (let c = 0; c < cols; c++) {
           const field = r.str();
           const n = r.u32();
-          numCols.push({ field, data: r.f64Array(n) });
+          const data = r.f64Array(n);
+          const blocks = r.u32();
+          numCols.push({ field, data, bmin: r.f64Array(blocks), bmax: r.f64Array(blocks) });
         }
         break;
       }

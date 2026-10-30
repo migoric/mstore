@@ -35,10 +35,13 @@ bench/
   bench.ts       写吞吐 / 读延迟 / 查询 p50-p99
   biz.ts         业务引擎专项压测
   open.ts        冷启动对比：逐页重放 vs 索引快照，逐字节比对两边查询结果
+  predicate.ts   区间查询 A/B：全表扫 vs 块级剪枝，逐行比对结果
+  scale.ts       规模可行性实验：每行索引成本 / open 曲线 / 外推 10GB
   demo.ts        小样本演示
-test/            按模块一一对应：bitmap/pagetable/biz/core/snapshot/protocol/store
-tools/mutate.ts  变异测试工具（把变异体写进临时副本，跑指定测试文件，统计存活）
+test/            按模块一一对应：bitmap/pagetable/biz/predicate/core/snapshot/protocol/store
+tools/mutate.ts  变异测试工具（每个 worker 一份源码副本，并行改写 + 跑测试，统计存活）
 docs/design.md   设计总纲。改架构先改它
+docs/scale-10g.md  撑到 10GB 的现状、瓶颈与四阶段改造（每阶段带验收判据）
 ```
 
 **模块边界**：`store.ts` 是唯一的门面，其它模块**不许互相反向依赖**——
@@ -50,17 +53,22 @@ docs/design.md   设计总纲。改架构先改它
 
 ```bash
 npm run typecheck          # tsc 7.0.2，noEmit。必须零错误，CI 第一道门
-npm test                   # 94 个用例，约 56s（大头是 fsync）
-npm run mutate             # src/bitmap.ts        9/9  100%
-npm run mutate:index       # src/bizindex.ts      9/9  100%
-npm run mutate:page        # src/pagetable.ts    32/32 100%
-npm run mutate:snap        # src/snapshot.ts     24/24 100%
-npm run mutate:store       # src/store.ts        61/62 98.4%（1 个已知等价变异）
-npm run mutate:all         # 五组全跑（含 snap，约 5–8 分钟；日常只跑目标文件那组）
+npm test                   # 122 个用例，约 58s（大头是 fsync）
+npm run mutate             # src/bitmap.ts       15/15  100%
+npm run mutate:index       # src/bizindex.ts     57/57  100%
+npm run mutate:page        # src/pagetable.ts    35/35  100%
+npm run mutate:snap        # src/snapshot.ts     24/24  100%
+npm run mutate:store       # src/store.ts        84/85  98.8%（含快照用例）
+npm run mutate:all         # 五组全跑（并行，约 5–8 分钟；日常只跑目标文件那组）
+
+# 变异默认 4 个 worker 并行。单 worker 原地跑（调试用，会留下改写痕迹）：
+node tools/mutate.ts --target src/bitmap.ts --tests test/bitmap.test.ts --workers 1
 
 npm run gen                # 生成 data/biz.db（30k 行）
 npm run bench              # 写读压测
 npm run bench:open         # 冷启动对比（先跑 npm run gen）
+npm run bench:predicate    # 区间查询 A/B（自带 --expose-gc）
+npm run bench:scale        # 规模曲线 + 外推 10GB（自带 --expose-gc）
 npm run demo               # 小样本演示
 
 ./cli.ts info data/biz.db  # CLI 全部命令见 ./cli.ts --help
@@ -147,9 +155,27 @@ npm run demo               # 小样本演示
 3. 目标文件的变异得分 **100%**。做不到的话，每个存活变异要么补用例杀掉，
    要么在同一行尾注 `// equiv` 并说明为什么等价。
 
-变异工具的判定细节容易卡人，踩过两次：
+变异工具本身有三条要注意的：
 
-- **`// equiv` 必须写在被变异那一行的行尾**。写在上一行无效——工具按行匹配。
+- **永远不碰主工作区**（连 `--workers 1` 也是先复制副本再跑）。以前是原地改写 + `finally`
+  恢复，被 `kill -9` 强杀时恢复没机会跑，`src/bizindex.ts` 里 `bruteForce` 的 `ok = false`
+  被留成了 `true`，之后所有 `{gte}` 查询都多返回行——白花两小时追一个根本不存在的剪枝 bug。
+  现在结束时会校验主工作区 sha256，变了直接 `exit 1`。
+- **默认并行 4 个 worker**。每个 worker 复制一份 `src/` + `test/` 到临时目录，各自改写、各自跑，
+  结束后目录自动删掉。加这个是因为给 bizindex 补了 9 个 12000 行的用例后，单轮从 0.5s 变成
+  20s，100 个变异体串行要 33 分钟——CI 必超时。并行后 bizindex 那组 33 分钟 → **约 1 分钟**。
+  `store.ts` 那组因为要连 `snapshot.test.ts` 一起跑，仍然要 **约 5.5 分钟**——它是最慢的一组，
+  别以为是卡住了。
+- 单个变异体的超时是 60s。**超时算「杀死」**：变异体能让测试挂死，说明测试确实依赖那段逻辑。
+- **`--tests` 必须覆盖到被测文件的全部分支**。`store.ts` 的快照逻辑只用 `core` + `biz` 跑会
+  留下 26 个存活变异（得分 70.1%），加上 `snapshot.test.ts` 才回到 98.8%
+  （剩下 1 个是空洞阈值的等值边界，已记为已知项）。看到「某个文件得分
+  突然掉下来」，先查测试集漏了哪个分支，而不是去补断言。
+
+变异判定细节容易卡人，踩过三次：
+
+- **`// equiv` 写在被变异那一行的行尾**（首选）。写在上一行也行，但那一行必须是纯注释
+  且带 `equiv`——我在这条上栽过三次，工具后来才加了「上一行也算」的容错。
 - 等价变异要真等价。`Writer.need` 的两处边界、`MAX_BLOCKS` 这类纯防御断言都是真等价；
   但「`rows: snap ? biz.size : 0`」这种是**不可观测**，不是等价，应该改写成
   `this.snapInfo?.rows ?? 0` 并补断言。
@@ -162,6 +188,8 @@ npm run demo               # 小样本演示
 - 断言不要依赖「存活行数」，那和 `nextRowid` 不是一个东西（删过行的库两者不等）。
 - 临时库统一放 `os.tmpdir()`，用例结束删掉；不要在 `data/` 里造垃圾。
 - 崩溃现场用「写完不 close 直接丢弃实例」模拟，不要真去 kill 进程。
+- **验证「剪枝 / 快照」这类优化，必须和 `bruteForce` 逐行对拍**，不能只断言行数。
+  剪枝剪错的行不会报错，只会静默少返回——这比慢危险一个量级。
 
 ## 已知坑
 
@@ -178,6 +206,11 @@ npm run demo               # 小样本演示
 | 压测不能改原库 | `bench/bench.ts` 曾在 `data/bench.db` 上直接 `clearNs('capture')`：第二次跑就空转，报「清空 0 条」还以为快得不真实，而且库被永久破坏。现在清空在副本上做 |
 | `p50=0µs` 是假象 | `performance.now()` 在 macOS 上分辨率约 1µs，纯内存点查落在 0。必须**批内累加再折算 ns/op**（每批 2000 次）。真实值是 p50 82ns / p99 156ns |
 | 空 ns 的读压测没有意义 | 点查 `get('capture', k)` 在 capture 为空时全部 miss，返回 null 极快——报出来的延迟测的是 miss 分支。压测前必须断言数据非空，并用 `list()` 拿真实 key |
+| 区间基准写在没入索引的字段上 | 默认数值字段只有 `level / updated_at / ms / bytes`。用 `salary` 测 `{gte, lte}` 走的是「字段不存在 → 立刻返回空」，那个 21.9ms 是「为返回空而扫完全表」。**区间基准必须落在真实入索引的字段上** |
+| 对照组做了不等量的事 | 拿「只返回 rowids」的旧算法和「返回 rowids + keys」的新算法比，结论会完全反过来：新算法在高命中率下看起来慢一倍，其实是多建了一个 6 万字符串的数组。做 A/B 前先数清楚两边的分配 |
+| 块级剪枝在命中率 100% 时会变慢 | 一块都剪不掉时，每块重算字范围纯属开销（实测慢 10–20%）。所以先数候选块，剪不掉 1/4 以上就退回全量遍历 |
+| 数值列的块统计只能放宽不能收窄 | 删行、覆盖写都不收缩 min/max。收缩会把「其实仍能命中」的块剪掉，静默丢行。多扫几块只是慢，剪错是错 |
+| 掐掉变异测试会留下被改写的源码 | 2026-10-31 实测：串行版变异跑到第 31 分钟被 Ctrl-C，`finally` 没执行，`bruteForce` 里的 `ok = false` 被留在 `ok = true`。之后所有「剪枝漏行」的失败都是这个假象。**现在变异工具一律在临时副本里改，主工作区一个字都不碰，并在结束时校验 sha256**。若见到主工作区莫名多出 `git diff`，先怀疑这个 |
 
 ## 提交规范
 

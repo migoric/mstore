@@ -254,6 +254,25 @@ test('keys 与 has 跟随索引', () => {
   assert.deepEqual(table.keys(), ['y']);
 });
 
+test('从快照恢复：keys 里的洞直接跳过，不会被当成一行装回去', () => {
+  const a = rig({ rowsPerPage: 48 });
+  a.table.put('k0', { i: 0 });
+  a.table.put('k1', { i: 1 });
+  a.table.put('k2', { i: 2 });
+  a.table.flushOpen();
+  const dir = a.table.snapshotDir().slice();
+
+  const b = new PageTable(a.io, a.meta, (x) => a.io.alloc(x), () => {}, { rowsPerPage: 48 });
+  // 中间那一项是洞：删掉的行留下的 rowid，快照里就是 undefined
+  b.restoreSnapshot(dir, ['k0', undefined, 'k2'], [0, 0, 0]);
+
+  assert.equal(b.size(), 2, '洞不算一行');
+  assert.equal(b.has('k0'), true);
+  assert.equal(b.has('k2'), true);
+  assert.deepEqual(b.get('k0'), { i: 0 }, '恢复出来的逻辑页要能真的读回数据');
+  assert.deepEqual(b.keys().sort(), ['k0', 'k2']);
+});
+
 test('clear 只重置目录，页数归零且目录写回 meta', () => {
   const { meta, table } = rig({ rowsPerPage: 2 });
   table.put('a', 1);
