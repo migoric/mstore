@@ -71,7 +71,7 @@ npm run mutate:index   # src/bizindex.ts ← test/biz.test.ts
 npm run mutate:page    # src/pagetable.ts ← test/pagetable.test.ts
 npm run mutate:snap    # src/snapshot.ts ← test/snapshot.test.ts
 npm run mutate:store   # src/store.ts    ← test/core.test.ts + test/biz.test.ts
-npm run mutate:all
+npm run mutate:all     # 五组全跑
 ```
 
 规则细节：
@@ -299,7 +299,7 @@ node bench/open.ts --rows 50000
   - `protocol` 是真的 spawn 一个 `cli.ts serve` 走管道，锁住 macOS 客户端依赖的那套协议
   - `core` 是「快速分支覆盖」，全程批量提交，5 秒跑完，专门喂给变异测试；
     `store` 是「长流程规模验证」（跨段 500 条、清空 200 条），慢但只跑一次
-- 变异测试：`npm run mutate:all`（不含 snapshot / store，这两组单跑 `mutate:snap`、`mutate:store`）
+- 变异测试：`npm run mutate:all`（五组全跑，约 5–8 分钟）；CI 只对改动到的 `src/` 文件跑对应那组
 
 ## 参与
 

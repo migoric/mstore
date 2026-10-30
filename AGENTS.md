@@ -56,7 +56,7 @@ npm run mutate:index       # src/bizindex.ts      9/9  100%
 npm run mutate:page        # src/pagetable.ts    32/32 100%
 npm run mutate:snap        # src/snapshot.ts     24/24 100%
 npm run mutate:store       # src/store.ts        61/62 98.4%（1 个已知等价变异）
-npm run mutate:all         # 前四组一起跑（不含 snap / store，按需单跑）
+npm run mutate:all         # 五组全跑（含 snap，约 5–8 分钟；日常只跑目标文件那组）
 
 npm run gen                # 生成 data/biz.db（30k 行）
 npm run bench              # 写读压测

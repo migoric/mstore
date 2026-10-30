@@ -25,7 +25,7 @@
     "mutate:index": "node tools/mutate.ts --target src/bizindex.ts --tests test/biz.test.ts",
     "mutate:page": "node tools/mutate.ts --target src/pagetable.ts --tests test/pagetable.test.ts",
     "mutate:store": "node tools/mutate.ts --target src/store.ts --tests test/core.test.ts,test/biz.test.ts",
-    "mutate:all": "npm run mutate && npm run mutate:index && npm run mutate:page && npm run mutate:store",
+    "mutate:all": "npm run mutate && npm run mutate:index && npm run mutate:page && npm run mutate:snap && npm run mutate:store",
     "gen": "node bench/gen.ts",
     "bench": "node bench/bench.ts",
     "demo": "node bench/demo.ts",
