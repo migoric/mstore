@@ -69,6 +69,7 @@ biz 不是「再开一个 KV 命名空间」，它多两样东西：**页表**�
 npm run mutate         # src/bitmap.ts   ← test/bitmap.test.ts
 npm run mutate:index   # src/bizindex.ts ← test/biz.test.ts
 npm run mutate:page    # src/pagetable.ts ← test/pagetable.test.ts
+npm run mutate:snap    # src/snapshot.ts ← test/snapshot.test.ts
 npm run mutate:store   # src/store.ts    ← test/core.test.ts + test/biz.test.ts
 npm run mutate:all
 ```
@@ -88,6 +89,7 @@ npm run mutate:all
 | `src/bitmap.ts` | 9/9 | **100%** |
 | `src/bizindex.ts` | 9/9 | **100%** |
 | `src/pagetable.ts` | 32/32 | **100%** |
+| `src/snapshot.ts` | 24/24 | **100%** |
 | `src/store.ts` | 61/62 | **98.4%** |
 
 **它抓出来的问题（都是人工 review 会漏的）：**
@@ -97,6 +99,7 @@ npm run mutate:all
 3. `_writeMeta(force)` 的 `force` 参数三个调用点全传 `true`，`if (!force && …)` 是死分支 → 参数整个去掉
 4. 页表用「每行 + 2 字节逗号余量」估算用量，**单行时低估 6 字节**（多算了不存在的逗号、少算了
    `{"r":[]}` 空壳）。结果是刚好超页的行能过检查、到 flush 才炸 → 改成精确字节账
+5. 快照的 `sniffSnapshot()` 没有任何调用点、`MAX_BLOCKS` 是两趟扫描已经拦得住的纯防御 → 都删掉
 
 顺带补出的用例都是「flush 之后没验证」这类漏洞：更新只改了内存没落盘、删除的行重开又复活、
 重复 flush 白写一页、`after` 落在第 0 个时不往后挪。
@@ -179,14 +182,18 @@ await db.close();
 
 ```ts
 const db = Store.open('data/app.db');
-for (const u of users) db.bizPut('biz', { name: u.name, dept: u.dept, salary: u.salary });
 
-db.bizQuery('biz', { dept: 'R&D', salary: [100, 200], limit: 50 });
+// 业务表只有一组命名空间（biz），key 由业务给
+for (const u of users) {
+  await db.bizPut(u.key, { name: u.name, dept: u.dept, salary: u.salary });
+}
+
+db.bizQuery({ eq: { dept: 'R&D' }, gte: { salary: 12000 }, limit: 50 });
 // → 位图 and + 提前退出，30k 行下 p50 8–9µs
 
-db.bizGet('biz', rowid);
-await db.bizDel('biz', rowid);   // 增量更新 alive 位图，不重建
-db.bizStats('biz');              // { live, pages, rewrite, ... }
+db.bizGet('u_1');                // key → 行
+await db.bizDel('u_1');          // 增量更新 alive 位图，不重建
+db.bizStats();                   // { pages: {...}, index: { rows, bitmaps, enumValues } }
 ```
 
 ## 压测（本机 x64 / Node 22.22 / V8 12.4）
@@ -221,14 +228,59 @@ node bench/biz.ts --rows 30000
 | `dept=R&D` 单条件 | 位图 p50 **10µs** / p99 72µs　全表扫 1.02ms |
 | `dept∈{R&D,QA}` 双值 | 位图 p50 **12µs** / p99 46µs　全表扫 1.26ms |
 | 三条件组合 | 位图 p50 **7µs** / p99 42µs　全表扫 1.23ms |
-| 冷启动 `open` | 173ms（行数 30000，重建 11 个位图） |
+| 冷启动 `open`（逐页重放） | 166ms（行数 30000，重建 11 个位图） |
+| 冷启动 `open`（索引快照） | **38ms**（4.3×） |
 
-位图相对全表扫快 **~100–180×**（差距随命中集比例浮动）。5 万行时是 22,817 行/秒、写放大 1.4×、
-冷启动 220ms —— 冷启动是当前最大的短板：行数越多位图重建越久。
-
-下一步是索引 snapshot——把位图和页目录整体存成一段，恢复时直接读回，预期降到 ~20ms。
+位图相对全表扫快 **~100–180×**（差距随命中集比例浮动）。5 万行时是 22,817 行/秒、写放大 1.4×。
 （页表改成精确字节账之后，同样 3 万行从 1058 页降到 1038 页，写放大 1.7× → 1.6×：原来每行多估 2 字节，
 一页实际能多塞一行。）
+
+## 冷启动：索引快照
+
+30k 行的库 `open` 要 166ms，全花在「把索引重新建一遍」：读 1038 个 4KB 页、解 3 万个小 JSON、
+往两个 Map 里插 6 万次、再逐行喂给位图索引。数据在盘上没动过，重建的只是**寻址结构**。
+
+所以给它做个快照：页目录、`key → 逻辑页`、`rowid ↔ key`、所有位图、数值列整体序列化成一段
+（`type = SNAPSHOT`，ns 是内核自己的 `sys`，不会被 `clearNs` 顺手带走），
+`meta.snap` 记下段位置 + CRC + 生成时的 `bizEpoch`。`open` 命中就一次 `pread` + 一次 `memcpy`，
+不命中就回退重放。
+
+```
+node bench/open.ts          # 同一份数据跑两条路，比耗时 + 逐字节比对 5 组筛选器
+node bench/open.ts --rows 50000
+```
+
+| 路径 | 30k 行 `open` |
+|---|---|
+| 逐页重放 | 166ms |
+| 索引快照 | **38ms**（4.3×） |
+
+三个决定，都是为了「快照坏了不能比没有快照更糟」：
+
+- **有效性只有一个判据**：`snap.epoch === meta.bizEpoch`。不用「段表签名」「行数对得上」这类近似判据——
+  页内原地更新会让段表一模一样但数据已经变了，近似判据在那儿会误判有效，然后读到旧数据。
+  每次 `bizPut` / `bizDel` / `bizClear` 都让 `bizEpoch` 自增，旧快照立刻作废。
+- **二进制而不是 JSON**：3 万行索引序列化成 JSON 约 3.5MB，解析要 30–40ms，省下来的时间又还回去了。
+  二进制版本是一份能直接 memcpy 的内存镜像。
+- **一个 key 只存一次**：`ROWS` 块的一行同时给出 `rowid`（索引侧）和 `logical`（页表侧），
+  恢复时**同一个字符串对象**插进两个 Map。省掉 3 万次字符串解码和一半字节
+  （文件 6.77MB → 6.47MB）。顺带说明：`Map.set` 3 万次就是 9ms，V8 已经对字符串键做了内部化，
+  手写开放寻址表实测并不更快——这块成本是硬的，只能靠少插一次来省。
+
+解码是「两趟」的：先扫一遍块头（挡住截断与长度错乱），再逐块落地。中途抛错就由 store 清掉
+半成品状态、回退重放——**绝不会拿着半个索引继续跑**。
+
+`stats().snapshot` 把「走的哪条路、为什么没走快照」直接暴露出来：
+
+```json
+{ "path": "snapshot", "openMs": 38.4, "note": "", "epoch": 12, "current": true,
+  "bytes": 1148930, "rows": 30000 }
+```
+
+客户端侧栏直接显示这两项。性能回退必须是可见的，否则它只会以「今天怎么有点慢」的形式出现。
+
+还没做的：KV 索引（抓包 / mock / agent）仍然每次重放 shell 段。它们的量与 30k 业务行不同量级，
+真成为瓶颈时再照这个格式加一个 `KV` 块即可（块带 tag，加块不用升版本）。
 
 ## 已知取舍与坑
 
@@ -242,18 +294,29 @@ node bench/biz.ts --rows 30000
 
 - Node **≥ 22.18**（能直接跑 `.ts` 的类型擦除；更早版本需要先 `tsc` 编译，且没有 `zlib.crc32`）
 - 类型检查：`npm run typecheck`（TypeScript 7）
-- 测试：`npm test` → **83 个用例**（约 55 秒）
-  - `bitmap` 16 / `pagetable` 24 / `biz` 9 / `core` 23 / `protocol` 4 / `store` 7
+- 测试：`npm test` → **94 个用例**（约 56 秒）
+  - `bitmap` 16 / `pagetable` 24 / `biz` 9 / `core` 23 / `snapshot` 11 / `protocol` 4 / `store` 7
   - `protocol` 是真的 spawn 一个 `cli.ts serve` 走管道，锁住 macOS 客户端依赖的那套协议
   - `core` 是「快速分支覆盖」，全程批量提交，5 秒跑完，专门喂给变异测试；
     `store` 是「长流程规模验证」（跨段 500 条、清空 200 条），慢但只跑一次
-- 变异测试：`npm run mutate:all`
+- 变异测试：`npm run mutate:all`（不含 snapshot / store，这两组单跑 `mutate:snap`、`mutate:store`）
+
+## 参与
+
+- [`AGENTS.md`](AGENTS.md)——在仓库里干活的操作手册：模块边界、代码约定、改动纪律、测试要求、已知坑。
+  做任何改动之前先读这个。
+- [`CONTRIBUTING.md`](CONTRIBUTING.md)——环境、PR 自查清单、报 Bug 要带什么。
+- [`CHANGELOG.md`](CHANGELOG.md)——版本与格式变更（`format_ver` 与包版本是两件事）。
+- [`SECURITY.md`](SECURITY.md)——威胁模型（明文、无访问控制、单写者）与漏洞报告方式。
+- [`docs/design.md`](docs/design.md)——设计总纲，改架构先改它。
+
+硬要求只有一条：**任何改动都要同时给单测和变异测试**，缺一个不算完成。
 
 ## 设计来源
 
 完整设计文档：`docs/design.md`（《本地数据子系统 · 设计总纲》，含单文件形态、段表、清空三档、跨表索引、可读性预算）。
-本仓库是实现侧的最小可用内核（M1）。已实现：段表 + group commit + CoW 页表 + 位图索引。
-尚未实现：索引 snapshot、抓包列存、向量旁路、`F_PUNCHHOLE` 打洞。
+本仓库是实现侧的最小可用内核（M1）。已实现：段表 + group commit + CoW 页表 + 位图索引 + 索引快照。
+尚未实现：抓包列存、向量旁路、`F_PUNCHHOLE` 打洞（需 C helper）。
 
 ## License
 

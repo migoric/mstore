@@ -1,0 +1,71 @@
+---
+name: Bug report
+description: 行为与预期不符、崩溃、数据被损坏
+labels: ['bug']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        先跑一下 `./cli.ts check <file.db>`，很多问题它能直接指出段头或索引的问题。
+
+        **请不要粘贴真实业务数据。** 需要样本库用 `node bench/gen.ts` 造。
+
+  - type: input
+    id: version
+    attributes:
+      label: mstore 版本 / commit
+      placeholder: 0.2.0 或 0b5e62b
+    validations:
+      required: true
+
+  - type: input
+    id: env
+    attributes:
+      label: 环境
+      description: node -v、操作系统、架构
+      placeholder: node v22.22.2 / macOS 26.0 / arm64
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤
+      description: 最好是一条 CLI 命令或一段最小脚本
+      render: bash
+      placeholder: |
+        ./cli.ts init /tmp/t.db
+        ./cli.ts biz-put /tmp/t.db k1 '{"dept":"R&D"}'
+        ./cli.ts biz-query /tmp/t.db --filter '{"eq":{"dept":"R&D"}}'
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+      description: 完整错误栈 / 非零退出码 / check 的输出
+      render: shell
+    validations:
+      required: true
+
+  - type: dropdown
+    id: layer
+    attributes:
+      label: 涉及哪一层
+      multiple: true
+      options:
+        - 不确定
+        - 段表 / 提交（committer, bufferpool, io）
+        - 业务页表（pagetable）
+        - 位图索引（bitmap, bizindex）
+        - 索引快照（snapshot）
+        - CLI / stdio 协议（cli.ts serve）
+        - 自检 check()

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全漏洞
+    url: https://github.com/migoric/mstore/security/advisories/new
+    about: 请不要开公开 issue，用私密漏洞报告
+  - name: 使用与设计问题
+    url: https://github.com/migoric/mstore/blob/main/docs/design.md
+    about: 先看设计总纲，很多「为什么不这样」在里面有答案

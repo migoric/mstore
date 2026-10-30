@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: typecheck + test (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22.18 是「原生 TS 类型擦除」不报警告的最低版本；24 是当前 LTS 之外的主线
+        node: ['22.18', '24']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci
+
+      # tsc 7.0.2 + noEmit。零错误是硬门禁
+      - name: typecheck
+        run: npm run typecheck
+
+      # 94 个用例。慢是因为写路径每条都 fsync（CI 盘比本机快，通常 20-30s）
+      - name: test
+        run: npm test
+
+      - name: CLI smoke
+        run: |
+          ./cli.ts init /tmp/ci.db
+          ./cli.ts put /tmp/ci.db capture c1 '{"hello":"world"}'
+          ./cli.ts get /tmp/ci.db capture c1
+          ./cli.ts check /tmp/ci.db
+          ./cli.ts biz-put /tmp/ci.db k1 '{"dept":"R&D","level":7,"status":"active","score":91.5}'
+          ./cli.ts biz-query /tmp/ci.db --filter '{"eq":{"dept":"R&D"}}'
+          ./cli.ts biz-stats /tmp/ci.db
+
+      # 快照路径必须被真正走到：造库（close 时写快照）→ 重开必须命中 snapshot → 查询结果一致。
+      # 用 bench/demo.ts 而不是 bench/gen.ts：前者走 bizPut（页表），后者走 ns shell，两者不是一个索引。
+      - name: snapshot roundtrip
+        run: |
+          node bench/demo.ts --out /tmp/ci-biz.db --biz 3000 --cap 200 --runs 4
+          node -e '
+            const { Store } = await import("./src/store.ts");
+            const db = Store.open("/tmp/ci-biz.db");
+            if (db.openPath !== "snapshot")
+              throw new Error("expected snapshot path, got " + db.openPath + " (" + db.openNote + ")");
+            const s = db.stats().snapshot;
+            if (s.rows !== 3000) throw new Error("snapshot rows " + s.rows + " != 3000");
+            const q = db.bizQuery({ eq: { dept: "R&D" } });
+            if (q.keys.length !== 600) throw new Error("dept=R&D -> " + q.keys.length + ", want 600");
+            console.log("snapshot hit: " + db.openMs + "ms, " + s.rows + " rows, " + s.bytes + "B");
+            await db.close();
+          '
+
+  mutation:
+    name: mutation (changed targets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.18'
+          cache: npm
+      - run: npm ci
+
+      # 变异测试是慢活（每组要跑一遍完整用例集），只对改动到的 src 文件跑。
+      # 得分不满 100% 就失败——这是 CONTRIBUTING 里的硬要求，不能靠人自觉。
+      - name: detect changed src
+        id: changed
+        run: |
+          base="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if [ -z "$base" ] || ! git cat-file -e "$base" 2>/dev/null; then
+            echo "targets=" >> "$GITHUB_OUTPUT"
+          else
+            files=$(git diff --name-only "$base" HEAD -- 'src/*.ts' | tr '\n' ' ')
+            echo "targets=$files" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: mutate
+        if: steps.changed.outputs.targets != ''
+        run: |
+          declare -A map=(
+            [src/bitmap.ts]=test/bitmap.test.ts
+            [src/bizindex.ts]=test/biz.test.ts
+            [src/pagetable.ts]=test/pagetable.test.ts
+            [src/snapshot.ts]=test/snapshot.test.ts
+            [src/store.ts]=test/core.test.ts,test/biz.test.ts
+          )
+          fail=0
+          for f in ${{ steps.changed.outputs.targets }}; do
+            tests="${map[$f]:-}"
+            if [ -z "$tests" ]; then
+              echo "::warning file=$f::没有配对的变异测试目标，跳过"
+              continue
+            fi
+            echo "=== $f ==="
+            node tools/mutate.ts --target "$f" --tests "$tests" || fail=1
+          done
+          exit $fail
