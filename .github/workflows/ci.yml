@@ -36,7 +36,7 @@ jobs:
       - name: typecheck
         run: npm run typecheck
 
-      # 94 个用例。慢是因为写路径每条都 fsync（CI 盘比本机快，通常 20-30s）
+      # 122 个用例。慢是因为写路径每条都 fsync（CI 盘比本机快，通常 20-40s）
       - name: test
         run: npm test
 
@@ -73,6 +73,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 必须全量历史：变异门禁靠 `git diff base HEAD -- src/*.ts` 决定跑哪几组。
+          # 默认 fetch-depth: 1 是浅克隆，base 提交根本不在本地，`git cat-file -e` 失败，
+          # 于是 targets 为空、mutate 整步被 `if:` 静默跳过——门禁看起来绿，实际一次没跑。
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: '22.18'
@@ -86,12 +91,14 @@ jobs:
         id: changed
         run: |
           base="${{ github.event.pull_request.base.sha || github.event.before }}"
-          if [ -z "$base" ] || ! git cat-file -e "$base" 2>/dev/null; then
-            echo "targets=" >> "$GITHUB_OUTPUT"
-          else
-            files=$(git diff --name-only "$base" HEAD -- 'src/*.ts' | tr '\n' ' ')
-            echo "targets=$files" >> "$GITHUB_OUTPUT"
+          if [ -z "$base" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            # 取不到基线就报错，不能悄悄跳过：跳过等于门禁不存在
+            echo "::error::取不到 base 提交 ${base}，无法判断该跑哪些变异组（checkout 需要 fetch-depth: 0）"
+            exit 1
           fi
+          files=$(git diff --name-only "$base" HEAD -- 'src/*.ts' | tr '\n' ' ')
+          echo "targets=$files" >> "$GITHUB_OUTPUT"
+          echo "改动到的 src：${files:-（无）}"
 
       - name: mutate
         if: steps.changed.outputs.targets != ''
@@ -104,6 +111,7 @@ jobs:
             [src/store.ts]=test/core.test.ts,test/biz.test.ts,test/snapshot.test.ts
           )
           fail=0
+          ran=0
           for f in ${{ steps.changed.outputs.targets }}; do
             tests="${map[$f]:-}"
             if [ -z "$tests" ]; then
@@ -111,7 +119,12 @@ jobs:
               continue
             fi
             echo "=== $f ==="
-            # 变异默认 4 worker 并行（每个 worker 一份临时副本），单组约 50s–6min
+            ran=$((ran + 1))
+            # 变异默认 4 worker 并行（每个 worker 一份临时副本），单组约 10s–6min
             node tools/mutate.ts --target "$f" --tests "$tests" --min 95 || fail=1
           done
+          if [ "$ran" -eq 0 ]; then
+            echo "::error::有改动的 src 文件，但一组变异都没跑起来——检查上面的映射表"
+            exit 1
+          fi
           exit $fail
