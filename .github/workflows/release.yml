@@ -1,0 +1,141 @@
+name: Release
+
+# v0.2.0 → npm pack 出 tarball，挂到 GitHub Release。
+# 手动触发只产 artifact、不发 release，用来验证打包链路。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '仅用于手动构建的版本号（不会产生 tag/release）'
+        required: false
+        default: '0.0.0-dev'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.18'
+          cache: npm
+
+      - run: npm ci
+
+      # 最便宜也最容易漏的一道门禁：tag 是 v0.3.0、package.json 还写 0.2.0 时，
+      # 发出去的包版本号是错的，而且没人会注意到——Release 页面标题对，包名对，
+      # 只有 `npm view` 和实际内容不一致。这里当场拦住。
+      - name: tag 与 package.json 版本一致
+        run: |
+          set -euo pipefail
+          ver="$(node -p 'require("./package.json").version')"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "手动构建，跳过一致性检查（版本 $ver）"
+            exit 0
+          fi
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$ver" != "$tag" ]; then
+            echo "::error::tag 是 $tag，但 package.json 是 $ver，先改版本号再打 tag"
+            exit 1
+          fi
+          echo "版本一致：$ver"
+
+      - name: typecheck
+        run: npm run typecheck
+
+      # 发布包里是 TS 源码（Node 直接类型擦除执行），语法错误会在用户那边才炸，
+      # 所以单测必须在打包前跑完。
+      - name: test
+        run: npm test
+
+      - name: npm pack
+        run: |
+          set -euo pipefail
+          npm pack --pack-destination dist
+          cd dist && sha256sum ./*.tgz | tee ./SHA256SUMS
+          # 包里必须有 cli.ts 和 src/，否则 bin 装出来是空的
+          tar -tzf ./*.tgz | grep -qx 'package/cli.ts'
+          tar -tzf ./*.tgz | grep -q '^package/src/index.ts$'
+          tar -tzf ./*.tgz | wc -l
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mstore-npm-pack
+          path: |
+            dist/*.tgz
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+      - name: 生成 release notes
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          ver="$(node -p 'require("./package.json").version')"
+          cat > /tmp/notes.md <<EOF
+          Node ${ver} 版内核。零依赖，\`src/**/*.ts\` 由 Node 直接执行（类型擦除），无构建步骤。
+
+          ## 安装
+
+          \`\`\`
+          npm i mstore@${ver}
+          \`\`\`
+
+          或从下方附件下载 \`mstore-${ver}.tgz\`：
+
+          \`\`\`
+          npm i ./mstore-${ver}.tgz
+          \`\`\`
+
+          要求 Node ≥ 22.18（需要 \`--experimental-strip-types\` 之后的默认类型擦除）。
+
+          ## 用法
+
+          \`\`\`bash
+          npx mstore init ./store.db                 # 建库
+          npx mstore serve ./store.db                # stdio NDJSON，macOS 客户端走这条
+          npx mstore biz-put ./store.db u_1 '{"dept":"R&D","level":7}'
+          npx mstore biz-query ./store.db --filter '{"gte":{"level":5}}' --limit 20
+          npx mstore info ./store.db                 # 段统计 / 提交统计
+          npx mstore check ./store.db                # 自检：段头、CRC、索引
+          \`\`\`
+
+          全部命令见 \`npx mstore --help\`。
+
+          完整变更见 [CHANGELOG.md](https://github.com/migoric/mstore/blob/${GITHUB_REF_NAME}/CHANGELOG.md)。
+
+          ## 校验
+
+          \`\`\`
+          $(cat dist/SHA256SUMS)
+          \`\`\`
+          EOF
+          cat /tmp/notes.md
+
+      - name: 发 Release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/*.tgz dist/SHA256SUMS --clobber
+            gh release edit "$tag" --notes-file /tmp/notes.md
+          else
+            gh release create "$tag" \
+              --title "mstore ${{ github.ref_name }}" \
+              --notes-file /tmp/notes.md \
+              dist/*.tgz dist/SHA256SUMS
+          fi

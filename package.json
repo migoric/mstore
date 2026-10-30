@@ -1,6 +1,6 @@
 {
   "name": "mstore",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Single-file local data store for Node: segment table + CRC + group commit, zero dependencies, TypeScript source run directly by Node.",
   "type": "module",
   "bin": {

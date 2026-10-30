@@ -1,139 +1,93 @@
 # mstore
 
-单文件本地存储，给「一个 macOS App + 一个 Node sidecar」这类本地优先应用用。
+单文件本地存储，给「本地优先应用 + 一个 sidecar 进程」这类形态用。
 零运行时依赖，TypeScript 源码由 Node 直接执行（类型擦除，无构建步骤）。
 
-```
-store.db
-├── [0,4K)      文件头      magic "MSTORE01" + format_ver + shellCap
-├── [4K,+1M)    meta.a      段表 + 各 ns seq 水位 + 空闲区，CRC32
-├── [+1M,+2M)   meta.b      同上，交替写入（原子切换，恢复取 CRC 通过且 gen 更大者）
-└── [2M,EOF)    段序列      每段 64B 自描述头 + payload
-```
+一个 `store.db` 顶一个数据库：段表 + CRC32 + group commit，没有服务端、没有端口、没有迁移。
 
-## 为什么长这样
+## 功能
 
-这套设计的出发点是三个实测结论（本机 x64 / Node 22）：
+**三类数据住在同一个文件里，写法和查询路径各自不同**
 
-| 事实 | 影响 |
+| 命名空间 | 形态 | 适合什么 | 查询 |
+|---|---|---|---|
+| `biz` | CoW 页表（4KB 页）+ 位图索引 | 固定字段、量大、常改的业务表 | 位图 and，µs 级 |
+| `capture` | NDJSON shell 段 | 只追加、可整表清空的日志/抓包 | 按 ns 段组，清空 O(段数) |
+| `agent` / `mock` | 独立 body 区段 | schema 不定的大 JSON（100KB–5MB） | 一次 `pread`，不 parse |
+
+**存储层**
+
+- **group commit**：整个进程只有一个 `fsync` 点，按窗口合并提交
+- **单文件 + 段表**：每段 64B 自描述头，双 meta（1MB×2 交替写，恢复取 CRC 通过且 gen 更大者）
+- **清空 = 标记段组 dead**：O(段数)，不是逐行删；尾部死段直接 `ftruncate` 归还
+- **崩溃最多丢一个心跳窗口**：段进度 500ms 落一次 meta，`flush()` / `close()` 强制落盘
+
+**业务表**
+
+- **CoW 页表 + 追加缓冲**：改一行重写整页，但新行先攒在内存，满页（按字节）才落一次盘
+- **位图索引**：枚举字段 `Uint32Array` 位图，数值字段 `Float64Array` 列
+- **数值区间块级剪枝**：数值列按 4096 行一块记 min/max，`{gte, lte}` 整块不可能命中就跳过
+- **索引快照**：冷启动跳过逐页重放，一次 `pread` + 一次 `memcpy`；快照失效自动回退
+
+**外围**
+
+- **stdio NDJSON 协议**（`serve`）：一行一请求、一行一响应，给 macOS 客户端类的外部进程驱动
+- **APFS clone 备份**：`backup` 是时点快照，几乎 0 秒
+- **NDJSON 导出**：`dump` / `export` 把任何二进制内容变成文本，数据可携带
+- **自检**：`check` 校验段头、CRC、索引、locator
+
+## 性能
+
+本机 Intel i7-1068NG7 / x64 / Node 22.22 / V8 12.4。手边没有的机器不猜测，以下全部是实测。
+
+**KV 写入与点查**（16.8MB 库，7100 条 KV）
+
+| 场景 | 结果 |
 |---|---|
-| `write` 4KB 只要 **8.3µs**，`fsync` 要 **20ms** | 写吞吐上限 = 提交频率，必须 group commit |
-| 300KB 文档读盘 0.27ms，`JSON.parse` 1.68ms | 大 body 永不 parse，只按 offset 交接 |
-| JS 表驱动 CRC 332MB/s，`zlib.crc32` 2812MB/s | CRC 必须用原生实现 |
+| 逐条 `await` 写入（每条约一次 fsync） | 300 条 **18.2s** → 16 条/秒 |
+| 同批并发写入（group commit） | 5000 条 **91ms** → **54,877 条/秒** |
+| 点查（内存索引，批量折算） | p50 **82 ns** / p99 156 ns |
+| 列表 50 条 | p50 **7 µs** / p99 112 µs |
+| 读 101KB body（一次 pread，不 parse） | p50 **87 µs** ≈1.2 GB/s |
+| 清空 5001 段 | **81.5 ms** |
+| 冷启动（重放 7100 条 KV 索引） | **60.6 ms** |
 
-## 核心机制
+**业务表**（30k 行，6.1MB 文件 / 3.7MB 有效负载）
 
-- **单写者 + 单 fd + 单 fsync 点**：整个进程只有一个地方调 `fsync`，按窗口合并提交。
-- **段（segment）**：分配与回收单位。`shell` 段预分配 1MB 攒批写；`body` 区段精确长度、写完即定。
-- **清空 = 标记段组 dead**：不是逐行删，是 O(段数)；尾部死段直接 `ftruncate` 归还空间。
-- **shell 段用 NDJSON**：可读性红利——`store dump` 出来的就是人眼可读的行。
-- **body 段存原始字节**：不 base64、不 parse、不格式化。
+| 场景 | 结果 |
+|---|---|
+| 批量写入 | **24,999 行/秒**（写放大 1.6×） |
+| `dept=R&D` 单条件 | 位图 p50 **9 µs** ／ 全表扫 1.94 ms |
+| `dept ∈ {R&D, QA}` | 位图 p50 **10 µs** ／ 全表扫 1.67 ms |
+| 三条件组合（`5≤level≤8`） | 位图 p50 **8 µs** ／ 全表扫 2.55 ms |
+| 冷启动 open（索引快照） | **35.9 ms** |
 
-## 三层引擎
+位图相对全表扫快 **~170–320×**。
 
-同一份文件里住着三类数据，各自的写法和查询路径都不一样：
+**数值区间查询**（100 万行，块级剪枝 vs 全表扫）
 
-| 数据 | 形态 | 落盘 | 查询 |
+| 场景 | 全表扫 | 块剪枝 | 加速 |
 |---|---|---|---|
-| **biz** 业务表 | 固定字段、量大、常改 | CoW 页表（4KB 页，页内 JSON 行数组） | 位图索引，p50 **8–9µs** |
-| **capture** 抓包 | 只追加、body 大、可整表清空 | NDJSON shell + body 区段 | 按 ns 段组，清空 O(段数) |
-| **agent** 执行结果 | schema 不定的大 JSON（100KB–5MB） | body 区段，精确长度、不留预留 | 一次 `pread`，不 parse |
+| 命中 0（区间落在空隙） | 6.22 ms | **0.02 ms** | ~230× |
+| 命中 0.01% | 6.44 ms | **0.06 ms** | ~105× |
+| 命中 20%（取前 50） | 2.47 ms | **0.05 ms** | ~47× |
+| 命中 20%（取全部 20 万行） | 17.03 ms | 11.50 ms | ~1.5× |
+| 命中 100% | 61.87 ms | 60.20 ms | 1.0×（无退化） |
 
-### 业务数据引擎
+块统计本身的开销：4096 行 16 字节，100 万行 **4KB**。
 
-biz 不是「再开一个 KV 命名空间」，它多两样东西：**页表**和**索引**。
+**冷启动随行数**（索引快照 vs 逐页重放，多轮取中位数）
 
-**CoW 页表**（`src/pagetable.ts`）：行按 4KB 页组织，页内是 `{r:[{k,v}]}` 的 JSON。
-改一行 = 整页重写到新偏移，旧页变空洞由 `reclaim` 回收。页目录 `pageDir: number[]` 存在 meta 里。
-
-只这么做写放大很难看——每行一次 4KB 重写。所以加了**追加缓冲**：新行先攒在 `openRows`，
-满页（按**字节**判断，不是按行数）或提交时才落一次盘。实测写放大从「每行 1 页」降到 **1.7×**。
-
-**位图索引**（`src/bitmap.ts` + `src/bizindex.ts`）：枚举字段建 `Uint32Array` 位图，
-数值字段建 `Float64Array`。查询是位图 `and`/`andNot`，不是全表扫。
-
-两个关键优化，都是被压测逼出来的：
-
-- **增量维护 `alive` 位图**：原本每次查询都要重建「死行集」，30k 行下光重建就吃掉 80µs。
-  改成删除时增量更新，查询直接 `acc.and(alive)`。
-- **`forEachWhile` 提前退出**：`LIMIT 50` 不需要扫完 3 万行匹配集，够了就停。
-
-两项合计把 p50 从 **85µs 打到 8–9µs**（10×）。
-
-## 变异测试
-
-`tools/mutate.ts` 是零依赖变异测试器：改一处运算符 → 跑测试 → 失败=杀死，通过=存活。
-单测覆盖率只说明「这行被执行过」，变异得分才说明「这行被验证过」。
-
-```bash
-npm run mutate         # src/bitmap.ts   ← test/bitmap.test.ts
-npm run mutate:index   # src/bizindex.ts ← test/biz.test.ts + test/predicate.test.ts
-npm run mutate:page    # src/pagetable.ts ← test/pagetable.test.ts
-npm run mutate:snap    # src/snapshot.ts ← test/snapshot.test.ts
-npm run mutate:store   # src/store.ts    ← test/core.test.ts + test/biz.test.ts
-npm run mutate:all     # 五组全跑
-```
-
-规则细节：
-
-- 逐行扫运算符（`>` `>=` `===` `!==` `&&` `||` `true` `false` …），替换成近似变异后跑测试
-- 剥掉行尾注释、跳过字符串字面量，否则注释里的 `→ x >= 0` 会被误当运算符
-- 语义等价的变异用 `// equiv` 标记跳过（规范写法是同**行尾注**，上一行是纯注释时也认）
-- 工具**从不改写主工作区**：曾在串行版本上按 Ctrl-C，`finally` 没机会跑，
-  把 `bruteForce` 里的 `ok = false` 留成了 `ok = true`，之后两小时都在追一个假 bug
-- `--tests a.ts,b.ts` 支持一次跑多个测试文件（`store.ts` 的分支散在两组用例里）
-- **默认 4 个 worker 并行**，每个 worker 一份 `src/` + `test/` 临时副本，主工作区一个字都不碰，
-  结束时校验 sha256。bizindex 那组从 33 分钟降到 **约 1 分钟**
-- 得分低于 70% 直接 `exit 1`
-
-当前得分：
-
-| 模块 | 杀死/总数 | 得分 | 用时 |
+| 行数 | 索引快照 | 逐页重放 | 加速 |
 |---|---|---|---|
-| `src/bitmap.ts` | 15/15 | **100%** | ~60s |
-| `src/bizindex.ts` | 57/57 | **100%** | ~61s |
-| `src/pagetable.ts` | 35/35 | **100%** | ~9s |
-| `src/snapshot.ts` | 24/24 | **100%** | ~30s |
-| `src/store.ts` | 84/85 | **98.8%** | ~340s |
+| 10k | 20.5 ms | 58.8 ms | 2.9× |
+| 30k | 35.9 ms | 159.0 ms | 4.4× |
+| 50k | 48.2 ms | 250.1 ms | 5.2× |
+| 100k | 178.1 ms | 593.2 ms | 3.3× |
 
-**它抓出来的问题（都是人工 review 会漏的）：**
-
-1. `pageKeys` 只写不读——上线 `alive` 位图后没人再读它，纯死状态 → 删掉
-2. `bizindex` 里两个分支一模一样的循环（`bm.constructor === Bitmap ? bm : bm`）→ 删掉
-3. `_writeMeta(force)` 的 `force` 参数三个调用点全传 `true`，`if (!force && …)` 是死分支 → 参数整个去掉
-4. 页表用「每行 + 2 字节逗号余量」估算用量，**单行时低估 6 字节**（多算了不存在的逗号、少算了
-   `{"r":[]}` 空壳）。结果是刚好超页的行能过检查、到 flush 才炸 → 改成精确字节账
-5. 快照的 `sniffSnapshot()` 没有任何调用点、`MAX_BLOCKS` 是两趟扫描已经拦得住的纯防御 → 都删掉
-6. **块级剪枝的 22 个变异体全部存活**——只断言「结果正确」根本区分不出「剪枝生效」和
-   「剪枝压根没跑」，因为剪枝失效时结果依然对，只是慢。于是加了 `lastScan`
-   （扫了几个块、走的哪条路）并断言它，22 个里 19 个立刻被杀死，剩下 3 个是纯性能等价
-7. **快照的失败路径从来没被走过**。「CRC 不对」有人测，「压根读不出来」「读出来了但结构坏」
-   没人测——两条岔路各有一个 `return false`，改成 `true` 都不会红。补了「meta 里的长度
-   改到越过文件尾」和「CRC 改对了但 magic 被抹掉」两个用例才堵上
-
-`store.ts` 另外还有两处赋值标了 `// equiv`，不是漏测，是**在任何公开 API 上都无法区分**：
-
-```ts
-this.meta.snap = snap;
-this.metaDirty = true;   // 等价：上面的 _registerSeg 已经标过脏；且 flush() 无条件写 meta
-```
-
-它们属于「防御性冗余」——留着是因为万一将来 `flush()` 改成按需写、或 `_registerSeg` 不再
-标脏，这两行就变成唯一信号。变异工具认 `// equiv` 标记，不会把它们算进分母。
-
-顺带补出的用例都是「flush 之后没验证」这类漏洞：更新只改了内存没落盘、删除的行重开又复活、
-重复 flush 白写一页、`after` 落在第 0 个时不往后挪。
-
-`store.ts` 剩下的 1 个存活变异在空洞阈值上：
-
-```ts
-if (span.len - need < F.SEG_HEADER_SIZE + 4096) this.freeSpans.splice(i, 1);
-//                                   ↑ 改成 <= 也测不出行为差异
-```
-
-它只决定「剩余不到 4KB 的空洞要不要继续留着」，改坏了只是多浪费几 KB 空间，不产生错误行为。
-要精确打这个边界得先造一个「剩余正好 4160 字节」的空洞（混合 cap 的 shell + body 段拼出来），
-成本高于收益，留着当已知项。
+50k→100k 快照解码撞上 V8 老生代 GC，加速比回落到 3.3×。这是当前天花板，
+要到百万行得把 key 块改成「偏移表 + 共享字符串池」。10GB 的完整瓶颈分析见
+[`docs/scale-10g.md`](docs/scale-10g.md)。
 
 ## 用法
 
@@ -143,27 +97,45 @@ node cli.ts put data/app.db biz u_1 '{"name":"张远","dept":"R&D"}'
 node cli.ts get data/app.db biz u_1
 node cli.ts list data/app.db capture --limit 5
 node cli.ts dump data/app.db capture    # NDJSON 到 stdout
-node cli.ts cat data/app.db agent run_0 # body 原样输出
-node cli.ts check data/app.db           # 自检：段头 / CRC / 索引 / locator
-node cli.ts export data/app.db out/     # 全库导出 NDJSON（数据可携带性）
-node cli.ts backup data/app.db snap.db  # APFS clone 时点快照（≈0 秒）
-node cli.ts serve data/app.db           # stdio NDJSON 协议，给 macOS 客户端用
+node cli.ts check data/app.db           # 自检
+node cli.ts export data/app.db out/     # 全库导出 NDJSON
+node cli.ts backup data/app.db snap.db  # APFS clone 时点快照
+node cli.ts serve data/app.db           # stdio 协议
 ```
 
-业务表走另一组命令（走页表 + 位图，不是 KV）：
+业务表走另一组（页表 + 位图，不是 KV）：
 
 ```bash
 node cli.ts biz-put   data/app.db u_1 '{"name":"张远","dept":"R&D","level":7}'
-node cli.ts biz-get   data/app.db u_1
-node cli.ts biz-del   data/app.db u_1
 node cli.ts biz-query data/app.db --filter '{"eq":{"dept":"R&D"},"gte":{"level":5}}' --limit 20
-node cli.ts biz-stats data/app.db        # 页数 / 行数 / 位图数 / 占用
+node cli.ts biz-stats data/app.db
 ```
 
 `--filter` 就是 `Filter` 的 JSON：`{eq: {字段: 值 | 值数组}, gte: {数值字段: n}, lte: {...}, limit, after}`。
 
-想先看点东西：`npm run demo` 生成 `data/demo.db`（3000 行业务 + 2000 条抓包 + 20 个 agent body，
-1.6 秒），然后 `node cli.ts serve data/demo.db` 丢给客户端。
+想先看点东西：`npm run demo` 生成 `data/demo.db`（3000 行业务 + 2000 条抓包 + 20 个 agent body，1.6 秒）。
+
+### 作为库用
+
+```ts
+import { Store } from './src/store.ts';
+
+// open 打开已有库；create 会 truncate 重建，只在建新库时用
+const db = Store.open('data/app.db');
+
+await db.put('biz', 'u_1', { name: '张远', dept: 'R&D' });
+await db.putBody('agent', 'run_1', bigJsonBytes, { agent: 'reviewer', status: 'done' });
+db.get('biz', 'u_1');            // 内存索引，µs 级
+db.getBody('agent', 'run_1');    // 一次 pread，不 parse
+await db.clearNs('capture');     // 清空 = 标记段组
+
+// 业务表（带索引维护）
+await db.bizPut('u_1', { name: '张远', dept: 'R&D', level: 7 });
+db.bizQuery({ eq: { dept: 'R&D' }, gte: { level: 5 }, limit: 50 });
+await db.bizDel('u_1');          // 增量更新 alive 位图，不重建
+db.bizStats();                   // { pages: {...}, index: { rows, bitmaps, enumValues } }
+await db.close();
+```
 
 ## stdio 协议
 
@@ -185,241 +157,39 @@ node cli.ts biz-stats data/app.db        # 页数 / 行数 / 位图数 / 占用
 
 出错一律 `{id, ok: false, error}`，未知 op 也不会把进程带死。
 
-```ts
-import { Store } from './src/store.ts';
+## 已知限制
 
-const db = Store.create('data/app.db');
-await db.put('biz', 'u_1', { name: '张远', dept: 'R&D' });
-await db.putBody('agent', 'run_1', bigJsonBytes, { agent: 'reviewer', status: 'done' });
-
-db.get('biz', 'u_1');            // 内存索引，µs 级
-db.getBody('agent', 'run_1');    // 一次 pread，不 parse
-await db.clearNs('capture');     // 清空 = 标记段组
-await db.close();
-```
-
-业务表走另一组 API（带索引维护）：
-
-```ts
-const db = Store.open('data/app.db');
-
-// 业务表只有一组命名空间（biz），key 由业务给
-for (const u of users) {
-  await db.bizPut(u.key, { name: u.name, dept: u.dept, salary: u.salary });
-}
-
-db.bizQuery({ eq: { dept: 'R&D' }, gte: { salary: 12000 }, limit: 50 });
-// → 位图 and + 提前退出，30k 行下 p50 8–9µs
-
-db.bizGet('u_1');                // key → 行
-await db.bizDel('u_1');          // 增量更新 alive 位图，不重建
-db.bizStats();                   // { pages: {...}, index: { rows, bitmaps, enumValues } }
-```
-
-## 压测（本机 Intel i7-1068NG7 / x64 / Node 22.22 / V8 12.4）
-
-```bash
-node bench/gen.ts --out data/bench.db --biz 2000 --cap 5000 --runs 100 --body 100
-node bench/bench.ts --file data/bench.db          # 16.8MB 库
-```
-
-| 场景 | 结果 |
-|---|---|
-| 逐条 `await` 写入（每条约一次 fsync） | 300 条 **18.2s** → 16 条/秒 |
-| 同批并发写入（group commit） | 5000 条 **91ms** → **54,877 条/秒**（合并成 2 次 fsync） |
-| 点查（内存索引，每批 2000 次折算） | p50 **82 ns** / p99 **156 ns** |
-| 列表 50 条 | p50 **7µs** / p99 **112µs** |
-| 读 101KB body（一次 pread，不 parse） | p50 **87µs** / p99 223µs（≈1.2GB/s） |
-| 读 0KB body | p50 **2µs** |
-| 清空 5001 段 | **81.5ms**，清空后 0 条，自检 0 问题 |
-| 冷启动（重放 7100 条 KV 索引） | **60.6ms** |
-
-结论一句话：**逐条提交是 16 条/秒，批提交是 5.5 万条/秒。差 3400 倍，全部来自 fsync 合并。**
-
-> 三条测量纪律，不守就会得到假数字：点查必须**批量折算**（`performance.now()` 在 macOS 上
-> 分辨率约 1µs，单次点查落在 0，早先报的「p50=0µs」其实是没测到）；压测**不能改原库**
-> （清空压测曾直接清 `data/bench.db`，第二次跑就空转还报「清空 0 条」）；两轮测量之间必须
-> `await close()`（`void close()` 会让下一轮 open 和上一轮的写快照抢 I/O）。
-
-### 业务数据引擎压测（30k 行）
-
-```bash
-node bench/biz.ts --rows 30000
-```
-
-| 场景 | 结果 |
-|---|---|
-| 写入 30000 行 | 1200ms → **24,999 行/秒**（页数 1038，重写 1051 次） |
-| 文件体积 / 有效负载 | 6.1MB / 3.7MB → 写放大约 **1.6×** |
-| `dept=R&D` 单条件 | 位图 p50 **9µs** / p99 56µs　全表扫 1.94ms |
-| `dept∈{R&D,QA}` 双值 | 位图 p50 **10µs** / p99 68µs　全表扫 1.67ms |
-| 三条件组合（`5≤level≤8`） | 位图 p50 **8µs** / p99 52µs　全表扫 2.55ms |
-| 冷启动 `open`（索引快照，稳态） | **35.9ms**（store 自报 `openMs`） |
-
-位图相对全表扫快 **~170–320×**（差距随命中集比例浮动）。
-50k 行时是 24,113 行/秒、写放大 1.4×，查询 p50 16–26µs（行数是 30k 的 1.67 倍，查询耗时也跟着涨）。
-
-### 冷启动随行数怎么变
-
-`node bench/open.ts --rows N --rounds 3`（先预热一轮丢弃，再取 3 轮中位数）：
-
-| 行数 | 索引快照 | 逐页重放 | 加速 |
-|---|---|---|---|
-| 10k | 20.5ms | 58.8ms | 2.9× |
-| 30k | 35.9ms | 159.0ms | 4.4× |
-| 50k | 48.2ms | 250.1ms | 5.2× |
-| 100k | **178.1ms** | 593.2ms | 3.3× |
-
-10k→50k 基本是线性的（约 0.6ms/千行），**50k→100k 跳了 3.7 倍**——快照解码是
-「10 万个 key 字符串 + 两遍 Map 插入」，撞上 V8 老生代 GC，加速比从 5.2× 回落到 3.3×，
-而且各轮波动变大（100k 三轮是 178 / 190 / 105ms）。这是当前已知的天花板：
-要到百万行级别，得把 key 块改成「偏移表 + 共享字符串池」，减少堆分配。
-
-## 数值区间查询：块级剪枝
-
-`{gte: {ms: A}, lte: {ms: B}}` 这类条件原先没有任何索引可用——它必须遍历整张存活位图，
-逐行读数值比较。命中 0 行的查询也要扫完 100 万行，这是 `limit` 救不了的
-（`limit` 只截断结果，不减少扫描）。
-
-现在数值列按 **4096 行一块**记 min/max（每块 16 字节，100 万行只要 4KB）。
-查询先问块统计，整块不可能命中就跳过：
-
-```bash
-node --expose-gc bench/predicate.ts --rows 1000000
-```
-
-| 场景（100 万行） | 全表扫 | 块剪枝 | 加速 |
-|---|---|---|---|
-| 命中 0（区间落在空隙） | 6.22ms | **0.02ms** | ~230× |
-| 命中 0.01% | 6.44ms | **0.06ms** | ~105× |
-| 命中 20%（取前 50） | 2.47ms | **0.05ms** | ~47× |
-| 命中 20%（取全部 20 万行） | 17.03ms | 11.50ms | ~1.5× |
-| 命中 100% | 61.87ms | 60.20ms | 1.0×（无退化） |
-
-两条必须遵守的规则：
-
-- **统计只放宽不收窄**。删行、覆盖写都不收缩 min/max（那块可能被多扫，但绝不会漏行）。
-  反过来会造成静默丢数据——比慢严重得多。
-- **剪枝不是免费的**。命中率接近 100% 时一块都剪不掉，每块重算字范围变成纯开销。
-  所以先数候选块，剪不掉 1/4 以上就自动退回全量遍历（上表最后一行 1.0× 就是这么来的）。
-  分母只算「真的落过行的块」——`capacity` 按 2 的幂翻倍，尾上一串空块会把候选比例稀释掉，
-  让「所有有数据的块都命中」这种最该退回全量的情形反而被判成「剪得挺好」。
-
-> 基准踩过的两个坑（都让数字失真过）：
->
-> 1. 早先用 `salary` 字段测区间查询，但 `salary` 不在默认数值字段
->    （`level / updated_at / ms / bytes`）里，查询走的是「字段不存在 → 立刻返回空」的快路径。
->    那个数字是「为返回空而扫完全表」，不是区间扫描。
-> 2. 原本是「旧算法连跑 40 次、再新算法连跑 40 次」，命中 100% 那档因此报成 **0.9×**
->    （看起来新算法更慢）。真正的原因是后跑的算法要承受前面积累的 GC 压力。
->    改成交错测量后同一份数据是 **1.0–1.1×**，之前那 15% 全是测量偏置。
-
-## 撑到 10GB 还差什么
-
-`docs/scale-10g.md` 有完整分析，一句话总结：**当前架构 10GB 不可用**——
-6600 万行对应约 6.0GB 常驻索引、约 90 秒冷启动。瓶颈是内存里**四份**按 key 索引的结构
-（`pagetable.index`、`bizindex.rowids`、`bizindex.keys`、shell 的 `store.idx` + `order`）。
-
-分四个阶段改造，每阶段有可量化的验收判据（阶段 1 即上面的块剪枝，已完成）：
-
-| 阶段 | 做什么 | 验收判据 |
-|---|---|---|
-| 1 ✅ | 数值列块级剪枝 | 区间查询命中 0 → ~230×，命中 100% 无退化 |
-| 2 | key 索引落盘（有序块 + 稀疏索引 + Bloom + 页缓存） | 100 万行 open 的 heap 从 89.3MB → <15MB |
-| 3 | 数值列 / 位图按块落盘（两级统计） | 10GB 下区间查询 ≤50ms（命中 20%） |
-| 4 | compaction + 按 key 分区多写者 | 导入 1000 万行 ≤4 分钟，写放大 ≤1.2× |
-
-## 冷启动：索引快照
-
-30k 行的库 `open` 要 159ms，全花在「把索引重新建一遍」：读 1038 个 4KB 页、解 3 万个小 JSON、
-往两个 Map 里插 6 万次、再逐行喂给位图索引。数据在盘上没动过，重建的只是**寻址结构**。
-
-所以给它做个快照：页目录、`key → 逻辑页`、`rowid ↔ key`、所有位图、数值列整体序列化成一段
-（`type = SNAPSHOT`，ns 是内核自己的 `sys`，不会被 `clearNs` 顺手带走），
-`meta.snap` 记下段位置 + CRC + 生成时的 `bizEpoch`。`open` 命中就一次 `pread` + 一次 `memcpy`，
-不命中就回退重放。
-
-```bash
-node bench/open.ts                    # 同一份数据跑两条路，比耗时 + 逐字节比对 5 组筛选器
-node bench/open.ts --rows 50000 --rounds 5
-```
-
-| 路径 | 30k 行 `open`（3 轮中位数） |
-|---|---|
-| 逐页重放 | 159ms |
-| 索引快照 | **35.9ms**（4.4×） |
-
-（`bench/open.ts` 会先跑一轮丢弃做预热，再取多轮中位数。第一轮永远是慢的——JIT 编译要
-几毫秒到十几毫秒，早先只跑一轮就报「38ms」，其实那是「JIT + 快照」的和。）
-
-三个决定，都是为了「快照坏了不能比没有快照更糟」：
-
-- **有效性只有一个判据**：`snap.epoch === meta.bizEpoch`。不用「段表签名」「行数对得上」这类近似判据——
-  页内原地更新会让段表一模一样但数据已经变了，近似判据在那儿会误判有效，然后读到旧数据。
-  每次 `bizPut` / `bizDel` / `bizClear` 都让 `bizEpoch` 自增，旧快照立刻作废。
-- **二进制而不是 JSON**：3 万行索引序列化成 JSON 约 3.5MB，解析要 30–40ms，省下来的时间又还回去了。
-  二进制版本是一份能直接 memcpy 的内存镜像。
-- **一个 key 只存一次**：`ROWS` 块的一行同时给出 `rowid`（索引侧）和 `logical`（页表侧），
-  恢复时**同一个字符串对象**插进两个 Map。省掉 3 万次字符串解码和一半字节
-  （文件 6.77MB → 6.47MB）。顺带说明：`Map.set` 3 万次就是 9ms，V8 已经对字符串键做了内部化，
-  手写开放寻址表实测并不更快——这块成本是硬的，只能靠少插一次来省。
-
-解码是「两趟」的：先扫一遍块头（挡住截断与长度错乱），再逐块落地。中途抛错就由 store 清掉
-半成品状态、回退重放——**绝不会拿着半个索引继续跑**。
-
-`stats().snapshot` 把「走的哪条路、为什么没走快照」直接暴露出来。下面是 3000 行的
-`data/demo.db` 实测（进程内第一次 `open`，所以 `openMs` 含 JIT）：
-
-```json
-{ "enabled": true, "path": "snapshot", "openMs": 41.41, "note": "", "current": true,
-  "epoch": 0, "bytes": 189368, "rows": 3000, "at": 1793381097088 }
-```
-
-同一个库第二次打开、JIT 已热时是 **6.7ms**。`path` 为 `replay` 时 `note` 会写原因
-（`no snapshot` / `stale (snap 12 ≠ biz 13)` / `snapshot CRC mismatch` / 段丢失）。
-
-客户端侧栏直接显示这两项。性能回退必须是可见的，否则它只会以「今天怎么有点慢」的形式出现。
-
-还没做的：KV 索引（抓包 / mock / agent）仍然每次重放 shell 段。它们的量与 30k 业务行不同量级，
-真成为瓶颈时再照这个格式加一个 `KV` 块即可（块带 tag，加块不用升版本）。
-
-## 已知取舍与坑
-
-- **body 不预留空间**：实测多次 `ftruncate` 增长会让 APFS 稀疏文件失效，预留 16MB×6 会把 23MB 数据占成 98MB。所以只有 shell 段预留（1MB），body 精确分配。
-- **清空后空间不一定立刻归还**：尾部死段用 `ftruncate`，中间死段先登记为可复用空洞。要立刻归还需要 `F_PUNCHHOLE`（Node 无 `fcntl`，需 20KB C helper，见 `MSTORE_PUNCH_HELPER`）。
-- **崩溃最多丢一个心跳窗口**：段进度 500ms 落一次 meta；`flush()`/`close()` 强制落盘。
-- **单写者**：不要开两个进程写同一个 `store.db`。
-- **meta 上限 1MB**（约 1.2 万段）：超了需要调大 `META_SIZE` 或压缩段表。
+- **单写者**：不要开两个进程写同一个 `store.db`
+- **body 不预留空间**：预留 16MB×6 会把 23MB 数据占成 98MB，所以 body 精确分配
+- **清空后空间不一定立刻归还**：尾部死段 `ftruncate`，中间死段登记为可复用空洞；
+  立刻归还需要的 `F_PUNCHHOLE` 在 Node 里没有（需 C helper，见 `MSTORE_PUNCH_HELPER`）
+- **meta 上限 1MB**：约 1.2 万段，超了要调大 `META_SIZE` 或压缩段表
+- **10GB 目前不可用**：内存里有四份全量 key 索引，6600 万行约 6.0GB、冷启动约 90 秒。
+  改造路线与验收判据见 [`docs/scale-10g.md`](docs/scale-10g.md)
+- **KV 命名空间每次打开都重放**：索引快照目前只覆盖 `biz`
 
 ## 需要什么
 
-- Node **≥ 22.18**（能直接跑 `.ts` 的类型擦除；更早版本需要先 `tsc` 编译，且没有 `zlib.crc32`）
-- 类型检查：`npm run typecheck`（TypeScript 7）
-- 测试：`npm test` → **122 个用例**（约 58 秒）
-  - `bitmap` 22 / `pagetable` 25 / `biz` 9 / `predicate` 17 / `core` 23 / `snapshot` 15 / `protocol` 4 / `store` 7
-  - `protocol` 是真的 spawn 一个 `cli.ts serve` 走管道，锁住 macOS 客户端依赖的那套协议
-  - `core` 是「快速分支覆盖」，全程批量提交，5 秒跑完，专门喂给变异测试；
-    `store` 是「长流程规模验证」（跨段 500 条、清空 200 条），慢但只跑一次
-  - `predicate` 的重点不是「剪枝快」而是「剪枝不漏行」：9 个用例与 `bruteForce` 逐行对拍，
-    6 个断言 `lastScan`（扫了几个块、走的哪条路）——只断结果的话，剪枝压根没跑也测不出来
-- 变异测试：`npm run mutate:all`（五组全跑，约 8 分钟；`store` 那组独占 5.5 分钟）；CI 只对改动到的 `src/` 文件跑对应那组，门槛 95%
+- Node **≥ 22.18**（能直接跑 `.ts` 的类型擦除；更早版本没有 `zlib.crc32`）
+- macOS 客户端：[`mstore-db`](https://github.com/migoric/mstore-db)
 
-## 参与
+```bash
+npm run typecheck    # TypeScript 7
+npm test             # 122 个用例，约 58s
+npm run mutate:all   # 变异测试五组，100%（store 那组 84/85）
+npm run bench:predicate -- --rows 1000000   # 区间查询 A/B
+npm run bench:scale  -- --rows 1000000      # 索引内存与冷启动
+```
 
-- [`AGENTS.md`](AGENTS.md)——在仓库里干活的操作手册：模块边界、代码约定、改动纪律、测试要求、已知坑。
-  做任何改动之前先读这个。
-- [`CONTRIBUTING.md`](CONTRIBUTING.md)——环境、PR 自查清单、报 Bug 要带什么。
-- [`CHANGELOG.md`](CHANGELOG.md)——版本与格式变更（`format_ver` 与包版本是两件事）。
-- [`SECURITY.md`](SECURITY.md)——威胁模型（明文、无访问控制、单写者）与漏洞报告方式。
-- [`docs/design.md`](docs/design.md)——设计总纲，改架构先改它。
+## 文档
 
-硬要求只有一条：**任何改动都要同时给单测和变异测试**，缺一个不算完成。
+- [`docs/design.md`](docs/design.md)——设计总纲，改架构先改它
+- [`docs/scale-10g.md`](docs/scale-10g.md)——10GB 的三道门槛与四阶段改造
+- [`AGENTS.md`](AGENTS.md)——在仓库里干活的操作手册（模块边界、测试要求、已知坑）
+- [`CHANGELOG.md`](CHANGELOG.md)——版本与格式变更（`format_ver` 与包版本是两件事）
+- [`SECURITY.md`](SECURITY.md)——威胁模型（明文、无访问控制、单写者）
 
-## 设计来源
-
-完整设计文档：`docs/design.md`（《本地数据子系统 · 设计总纲》，含单文件形态、段表、清空三档、跨表索引、可读性预算）。
-本仓库是实现侧的最小可用内核（M1）。已实现：段表 + group commit + CoW 页表 + 位图索引 + 索引快照。
-尚未实现：抓包列存、向量旁路、`F_PUNCHHOLE` 打洞（需 C helper）。
+硬要求只有一条：**任何改动都要同时给单测和变异测试**。
 
 ## License
 

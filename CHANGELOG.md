@@ -6,7 +6,7 @@
 文件格式版本独立于包版本：`format_ver` 变动代表**旧文件需要迁移**，
 包版本变动不代表格式变动。两者都记在下面。
 
-## [Unreleased]
+## [0.3.0] — 2026-10-31
 
 ### Added
 - **数值列块级剪枝**：数值列按 4096 行记 `min/max`（100 万行只占 4KB），
@@ -87,6 +87,14 @@
 - README 压测数字全部重新实测（Intel i7-1068NG7 / Node 22.22）：30k 行查询 p50 8–10µs、
   冷启动快照 35.9ms（重放 159ms，4.4×）、并发写 54,877 条/秒。
 - 新增「冷启动随行数怎么变」表：10k/30k/50k 线性，**100k 跳到 178ms**（GC 压力，加速比回落 3.3×）。
+- README 重写为「功能 + 性能指标 + 用法」，设计推导与踩坑记录移到 `docs/design.md`。
+
+### 发布
+- 新增 `.github/workflows/release.yml`：`v*` tag 触发 → typecheck → test → `npm pack` →
+  自检 tarball 内含 `cli.ts` 与 `src/index.ts` → 发 GitHub Release 附 tarball 与 SHA256SUMS。
+- 门禁：**tag 必须与 `package.json` 的 version 一致**。否则发出去的包版本号是错的，
+  而 Release 页标题看着完全正常，没人会发现。
+- 手动触发（`workflow_dispatch`）只产 artifact、不发 release，用来验证打包链路。
 
 ### 计划中
 - **阶段 2：key 索引落盘**（10GB 的关键一步）。现在内存里有**四份**按 key 索引的结构
