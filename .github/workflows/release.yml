@@ -63,6 +63,10 @@ jobs:
       - name: npm pack
         run: |
           set -euo pipefail
+          # npm pack 的 --pack-destination 不会自己建目录，缺了就 ENOENT 到
+          # 「open .../dist/mstore-0.3.0.tgz: no such file or directory」，看着像打包失败，
+          # 其实是输出目录不存在。
+          mkdir -p dist
           npm pack --pack-destination dist
           cd dist && sha256sum ./*.tgz | tee ./SHA256SUMS
           # 包里必须有 cli.ts 和 src/，否则 bin 装出来是空的

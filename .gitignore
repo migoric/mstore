@@ -3,3 +3,6 @@ data/*.db
 data/*.db-bak
 *.log
 .DS_Store
+
+# 发布流水线的产物
+dist/
