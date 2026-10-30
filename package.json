@@ -1,6 +1,6 @@
 {
   "name": "mstore",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Single-file local data store for Node: segment table + CRC + group commit, zero dependencies, TypeScript source run directly by Node.",
   "type": "module",
   "bin": {
@@ -20,7 +20,7 @@
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
-    "test": "node --test test/bitmap.test.ts test/pagetable.test.ts test/biz.test.ts test/core.test.ts test/protocol.test.ts test/store.test.ts",
+    "test": "node --test test/bitmap.test.ts test/pagetable.test.ts test/biz.test.ts test/core.test.ts test/snapshot.test.ts test/protocol.test.ts test/store.test.ts",
     "mutate": "node tools/mutate.ts --target src/bitmap.ts --tests test/bitmap.test.ts",
     "mutate:index": "node tools/mutate.ts --target src/bizindex.ts --tests test/biz.test.ts",
     "mutate:page": "node tools/mutate.ts --target src/pagetable.ts --tests test/pagetable.test.ts",
@@ -28,7 +28,9 @@
     "mutate:all": "npm run mutate && npm run mutate:index && npm run mutate:page && npm run mutate:store",
     "gen": "node bench/gen.ts",
     "bench": "node bench/bench.ts",
-    "demo": "node bench/demo.ts"
+    "demo": "node bench/demo.ts",
+    "mutate:snap": "node tools/mutate.ts --target src/snapshot.ts --tests test/snapshot.test.ts",
+    "bench:open": "node bench/open.ts"
   },
   "keywords": [
     "storage",

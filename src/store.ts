@@ -20,6 +20,8 @@ import { Committer } from './committer.ts';
 import { crc32, crc32Impl } from './crc32.ts';
 import { PageTable } from './pagetable.ts';
 import { BizIndex } from './bizindex.ts';
+import { encodeSnapshot, decodeSnapshot } from './snapshot.ts';
+import type { SnapInfo } from './snapshot.ts';
 import type { Filter } from './bizindex.ts';
 import type {
   Meta,
@@ -29,6 +31,7 @@ import type {
   CheckReport,
   CheckIssue,
   StoreStats,
+  SnapMeta,
   NsName,
 } from './types.ts';
 
@@ -45,6 +48,11 @@ export interface StoreOpts {
   bizNumFields?: string[];
   /** 页大小（CoW 页表），默认 4096 */
   pageSize?: number;
+  /**
+   * 是否启用索引快照，默认 true。
+   * 关掉之后每次 open 都逐页重放——调试「快照和重放结果不一致」时用。
+   */
+  snapshot?: boolean;
 }
 
 const DEFAULT_ENUM_FIELDS = ['dept', 'status', 'type', 'kind'];
@@ -85,11 +93,23 @@ export class Store {
   readonly pages: PageTable;
   readonly biz: BizIndex;
 
+  /** 快照开关（关掉只影响性能，不影响结果） */
+  readonly snapshotEnabled: boolean;
+  /** 上次 open 走的哪条路：'snapshot' | 'replay' | 'fresh' */
+  openPath: 'snapshot' | 'replay' | 'fresh' = 'fresh';
+  /** 上次 open 为什么没用快照（用于诊断，正常为空） */
+  openNote = '';
+  /** 上次 open 的耗时（ms） */
+  openMs = 0;
+  /** 上次快照恢复的规模：快照里到底装了多少行、多少位图（展示与自检用） */
+  snapInfo: SnapInfo | null = null;
+
   private constructor(io: Io, meta: Meta, slot: 'a' | 'b', shellCap: number, opts: StoreOpts = {}) {
     this.io = io;
     this.meta = meta;
     this.metaSlot = slot;
     this.shellCap = shellCap;
+    this.snapshotEnabled = opts.snapshot ?? true;
     this.pool = new BufferPool(io);
     this.committer = new Committer({
       flush: () => this._flushNow(),
@@ -125,6 +145,7 @@ export class Store {
   }
 
   static open(file: string, opts: StoreOpts = {}): Store {
+    const t0 = performance.now();
     const io = Io.open(file);
     const head = F.decodeHeader(io.readAt(0, F.HEADER_SIZE));
     const a = F.decodeMeta(io.readAt(F.META_A_OFF, F.META_SIZE));
@@ -136,11 +157,77 @@ export class Store {
     candidates.sort((x, y) => y.meta.gen - x.meta.gen);
     const picked = candidates[0]!;
     const store = new Store(io, picked.meta, picked.slot, opts.shellCap ?? opts.segSize ?? head.segSize ?? MB, opts);
-    store._rebuildIndex();
+
+    store._rebuildIndex(); // KV 索引始终靠重放 shell，快照只覆盖业务表
+    if (store._loadSnapshot()) {
+      store.openPath = 'snapshot';
+    } else {
+      store.openPath = 'replay';
+      store.pages.load();
+      store._rebuildBiz();
+    }
     store._reopenShell();
-    store.pages.load();
-    store._rebuildBiz();
+    store.openMs = +(performance.now() - t0).toFixed(2);
     return store;
+  }
+
+  /**
+   * 试着用索引快照恢复业务表。
+   *
+   * 判据只有一个：`snap.epoch === meta.bizEpoch`。不用「段表签名」「行数对得上」这类
+   * 近似判据——页内原地更新会让段表一模一样但数据已经变了，近似判据在那里会误判有效。
+   *
+   * 任何一步不对都返回 false 并记下原因，由 open 回退到逐页重放。**恢复残留是不可能的**：
+   * decodeSnapshot 是「全部解析完才落地」，中途抛错时 pages / biz 一个字节都没动过。
+   */
+  private _loadSnapshot(): boolean {
+    if (!this.snapshotEnabled) {
+      this.openNote = 'disabled';
+      return false;
+    }
+    const snap = this.meta.snap;
+    if (!snap) {
+      this.openNote = 'no snapshot';
+      return false;
+    }
+    const epoch = this.meta.bizEpoch ?? 0;
+    if (snap.epoch !== epoch) {
+      this.openNote = `stale (snap ${snap.epoch} ≠ biz ${epoch})`;
+      return false;
+    }
+    const seg = this.segById.get(snap.seg);
+    if (!seg || !seg.live) {
+      this.openNote = `snapshot seg ${snap.seg} missing or dead`;
+      return false;
+    }
+    let buf: Buffer;
+    try {
+      buf = this.io.readAt(snap.off, snap.len);
+    } catch {
+      this.openNote = `snapshot truncated at ${snap.off}+${snap.len}`;
+      return false;
+    }
+    if (crc32(buf) !== snap.crc) {
+      this.openNote = 'snapshot CRC mismatch';
+      return false;
+    }
+    try {
+      this.snapInfo = decodeSnapshot(buf, this.pages, this.biz);
+    } catch (err) {
+      this.openNote = `snapshot rejected: ${(err as Error).message}`;
+      // 解码是「边读边填」的，抛错时内存里可能是半个索引——清干净再交给重放，
+      // 否则回退路径会把半个索引当底子继续往里填，最后得到一个又慢又错的状态。
+      this.pages.restoreSnapshot([], [], [], []);
+      this.biz.clear();
+      this.snapInfo = null;
+      return false;
+    }
+    return true;
+  }
+
+  /** 把当前索引写成一份快照（epoch 没变就跳过）。返回是否真写了 */
+  writeSnapshot(): boolean {
+    return this._writeSnapshot();
   }
 
   /** 从 shell 段重放索引；body 区段不扫（由 shell 里的 locator 引用） */
@@ -367,9 +454,15 @@ export class Store {
       const seq = this._nextSeq(n);
       this.pages.put(key, value);
       const rowid = this.biz.put(key, value);
+      this._bumpBizEpoch();
       this.metaDirty = true; // equiv: pages.put 已经通过 markDirty 标过脏，这里只是不依赖那条路径
       return { seq, rowid };
     });
+  }
+
+  /** 业务数据变了，旧索引快照立刻作废（这是快照唯一的有效性判据） */
+  private _bumpBizEpoch(): void {
+    this.meta.bizEpoch = (this.meta.bizEpoch ?? 0) + 1;
   }
 
   bizGet(key: string): unknown {
@@ -382,6 +475,7 @@ export class Store {
       const seq = this._nextSeq(n);
       const removed = this.pages.delete(key);
       this.biz.delete(key);
+      this._bumpBizEpoch();
       this.metaDirty = true; // equiv: pages.delete 要么 writePage（persistDir 标脏），要么 flushOpen 时落盘，总会走到
 
       return { seq, removed };
@@ -404,6 +498,7 @@ export class Store {
       const rows = this.biz.size;
       this.pages.clear();
       this.biz.clear();
+      this._bumpBizEpoch();
       this.metaDirty = true; // equiv: pages.clear 走 persistDir，已经标过脏
       return { seq, rows };
     });
@@ -529,6 +624,62 @@ export class Store {
     }
   }
 
+  // ---------------- 索引快照 ----------------
+
+  /**
+   * 把当前索引写成一份新快照。epoch 没变就什么都不做（重复调用是免费的）。
+   *
+   * 顺序是「先退役旧的、再回收空间、最后写新的」：
+   * 写完之后快照段一定在物理尾部，下次退役时能被 `_reclaimTail` 直接截掉，
+   * 不会在文件里堆一串没人认领的旧快照。
+   */
+  private _writeSnapshot(): boolean {
+    if (!this.snapshotEnabled) return false;
+    const epoch = this.meta.bizEpoch ?? 0;
+    const cur = this.meta.snap;
+    if (cur && cur.epoch === epoch) return false; // 索引没变，重写纯属浪费
+
+    // 空库不写：一个 0 行的索引快照只是多占一个段
+    if (this.pages.snapshotDir().length === 0 && this.biz.size === 0) {
+      if (cur) this._retireSnapshot();
+      return false;
+    }
+
+    if (cur) this._retireSnapshot();
+
+    const buf = encodeSnapshot(this.pages, this.biz);
+    const crc = crc32(buf);
+    const seg = this._registerSeg(F.NS_ID.sys!, F.T.SNAP, buf.length, buf.length, 0, crc);
+    this.io.writeAt(
+      F.encodeSegHeader({ id: seg.id, type: F.T.SNAP, ns: seg.ns, rows: 0, len: buf.length, crc }),
+      seg.off
+    );
+    this.io.writeAt(buf, seg.off + F.SEG_HEADER_SIZE);
+
+    const snap: SnapMeta = {
+      seg: seg.id,
+      off: seg.off + F.SEG_HEADER_SIZE,
+      len: buf.length,
+      crc,
+      epoch,
+      at: Date.now(),
+    };
+    this.meta.snap = snap;
+    this.metaDirty = true;
+    return true;
+  }
+
+  /** 退役旧快照：标 dead 后交给尾部回收，能在尾部就直接截掉 */
+  private _retireSnapshot(): void {
+    const snap = this.meta.snap;
+    if (!snap) return;
+    const seg = this.segById.get(snap.seg);
+    if (seg) seg.live = false;
+    this.meta.snap = undefined;
+    this.metaDirty = true;
+    this._reclaimTail();
+  }
+
   /** 无条件写一份 meta 到另一个槽（要不要写由调用方判断，这里不做二次过滤） */
   private _writeMeta(): void {
     this.meta.gen += 1;
@@ -545,6 +696,7 @@ export class Store {
     await this.committer.drainNow();
     this.pool.flushAll();
     this.pages.flushOpen();
+    this._writeSnapshot(); // 先把快照段写下去，再写 meta（meta 才记这个指针）
     this._writeMeta();
     this.io.fsync();
   }
@@ -562,22 +714,26 @@ export class Store {
   stats(): StoreStats {
     let shell = 0;
     let body = 0;
+    let snapSegs = 0;
     let dead = 0;
     let allocated = 0;
     for (const s of this.meta.segs) {
       if (s.type === F.T.SHELL) shell++;
       else if (s.type === F.T.BODY) body++;
+      else if (s.type === F.T.SNAP) snapSegs++;
       if (!s.live) dead++;
       allocated += F.SEG_HEADER_SIZE + s.cap;
     }
     const records: Record<string, number> = {};
     for (const [ns, m] of this.idx) records[F.NS_NAME[ns] ?? String(ns)] = m.size;
+    const snap = this.meta.snap;
+    const epoch = this.meta.bizEpoch ?? 0;
     return {
       file: this.io.path,
       bytesLogical: this.io.size(),
       bytesAllocated: F.DATA_OFF + allocated,
       segSize: this.shellCap,
-      segs: { shell, body, free: this.freeSpans.length },
+      segs: { shell, body, free: this.freeSpans.length, snapshot: snapSegs },
       deadSegs: dead,
       pendingReclaim: this.meta.pending.length,
       records,
@@ -585,6 +741,17 @@ export class Store {
       crcImpl: crc32Impl,
       fsyncs: this.io.fsyncCount,
       committer: this.committer.report(),
+      snapshot: {
+        enabled: this.snapshotEnabled,
+        path: this.openPath,
+        openMs: this.openMs,
+        note: this.openNote,
+        epoch,
+        current: !!snap && snap.epoch === epoch,
+        bytes: snap?.len ?? 0,
+        rows: this.snapInfo?.rows ?? 0,
+        at: snap?.at ?? 0,
+      },
     };
   }
 
@@ -677,6 +844,29 @@ export class Store {
             detail: `body range out of bounds: ${e.b.o}+${e.b.l} not in [${min},${max})`,
           });
         }
+      }
+    }
+
+    // 快照指针自洽：meta.snap 指向的段必须存在、活着，且三处长度 / CRC 一致。
+    // 这三处任何一处对不上，open 会拒绝快照并回退重放——但那时是「悄悄慢下来」，
+    // 自检必须把它明确报出来，否则性能回退会没有任何线索。
+    const snap = this.meta.snap;
+    if (snap) {
+      const seg = this.segById.get(snap.seg);
+      if (!seg || !seg.live) {
+        issues.push({ level: 'error', where: 'snapshot', detail: `points to missing/dead seg ${snap.seg}` });
+      } else if (seg.off + F.SEG_HEADER_SIZE !== snap.off || seg.len !== snap.len || seg.crc !== snap.crc) {
+        issues.push({
+          level: 'error',
+          where: 'snapshot',
+          detail: `pointer mismatch: snap(${snap.off}+${snap.len},crc ${snap.crc.toString(16)}) vs seg(${seg.off + F.SEG_HEADER_SIZE}+${seg.len},crc ${seg.crc.toString(16)})`,
+        });
+      } else if (snap.epoch !== (this.meta.bizEpoch ?? 0)) {
+        issues.push({
+          level: 'warn',
+          where: 'snapshot',
+          detail: `stale: snap epoch ${snap.epoch}, biz epoch ${this.meta.bizEpoch ?? 0} (下一次 open 会走重放)`,
+        });
       }
     }
 

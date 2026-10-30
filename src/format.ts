@@ -25,13 +25,19 @@ export const SEG_MAGIC: Buffer = Buffer.from('SEG0', 'latin1');
 export const DEFAULT_SEG_SIZE = 16 * 1024 * 1024;
 
 /** 段类型 */
-export const T = { FREE: 0, SHELL: 1, BODY: 2 } as const;
+export const T = { FREE: 0, SHELL: 1, BODY: 2, SNAP: 3 } as const;
 export type SegType = (typeof T)[keyof typeof T];
-export const TYPE_NAME: Record<number, string> = { 0: 'free', 1: 'shell', 2: 'body' };
+export const TYPE_NAME: Record<number, string> = { 0: 'free', 1: 'shell', 2: 'body', 3: 'snapshot' };
 
-/** 命名空间写进段头，用于「整段丢弃」式清空 */
-export const NS_ID: Record<string, number> = { biz: 1, capture: 2, mock: 3, agent: 4 };
-export const NS_NAME: Record<number, string> = { 1: 'biz', 2: 'capture', 3: 'mock', 4: 'agent' };
+/**
+ * 命名空间写进段头，用于「整段丢弃」式清空。
+ *
+ * `sys` 不属于任何业务 ns，只放内核自己的段（索引快照）。单独占一个号是为了
+ * 让 `clearNs('biz')` 之类不会顺手把快照也标死 —— 快照的有效性由 epoch 判断，
+ * 不靠「跟着 ns 一起死」。
+ */
+export const NS_ID: Record<string, number> = { biz: 1, capture: 2, mock: 3, agent: 4, sys: 5 };
+export const NS_NAME: Record<number, string> = { 1: 'biz', 2: 'capture', 3: 'mock', 4: 'agent', 5: 'sys' };
 
 export function nsId(ns: string | number): number {
   const id = typeof ns === 'number' ? ns : NS_ID[ns];

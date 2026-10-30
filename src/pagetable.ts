@@ -305,6 +305,56 @@ export class PageTable {
       for (const r of rows) yield [r.k, r.v];
     }
   }
+
+  // ---------------- 快照 ----------------
+  //
+  // 页表里「贵」的不是页内容，是把页解回 key→逻辑页 的那一遍 JSON.parse：
+  // 3 万行要读 1038 页、解 3 万个小 JSON，实测 80ms 上下。快照直接把这份映射存下来，
+  // 恢复时只走一次 memcpy —— 页内容本身不用读，因为 dir 里的偏移就是它的地址。
+  //
+  // 快照**不自带有效性判断**：页表不知道数据有没有被改过，那是 store 的 bizEpoch 的事。
+
+  /** 快照用：页目录（返回内部结构，调用方只读） */
+  snapshotDir(): readonly number[] {
+    return this.dir;
+  }
+
+  /** 快照用：key → 逻辑页号（返回内部结构，调用方只读） */
+  snapshotIndex(): ReadonlyMap<string, number> {
+    return this.index;
+  }
+
+  /**
+   * 从快照恢复内存映射：只改内存，不读盘也不写盘。
+   * 页内容仍然在磁盘上，`dir` 里的偏移就是它们的地址。
+   *
+   * `keys[i]` 与 `logicals[i]` 是**并行数组**而不是 `[key, logical]` 二元组：
+   * 3 万个二元组就是 3 万个小对象，光分配和回收就要好几毫秒，
+   * 而并行数组可以让快照解码边读边填，全程零中间对象。
+   *
+   * `keys` 允许有洞（删过的行留下的 rowid），洞直接跳过。
+   * `extra` 是「页表有、位图索引没有」的兜底 key，正常为空。
+   */
+  restoreSnapshot(
+    dir: readonly number[],
+    keys: readonly (string | undefined)[],
+    logicals: readonly number[],
+    extra: ReadonlyArray<readonly [string, number]> = []
+  ): void {
+    this.dir = dir.slice();
+    this.index.clear();
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i];
+      if (k === undefined) continue;
+      this.index.set(k, logicals[i]!);
+    }
+    for (const [k, logical] of extra) this.index.set(k, logical);
+    // 追加缓冲一律清空：快照是「某一时刻已落盘的状态」，未落盘的行不属于它
+    this.openLogical = null;
+    this.openRows = [];
+    this.openBytes = 0;
+    this.openDirty = false;
+  }
 }
 
 /** 页表的垃圾统计：有多少已分配字节不在当前目录里（供 vacuum 决策） */

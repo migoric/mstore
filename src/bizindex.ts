@@ -28,9 +28,17 @@ export interface Filter {
 
 export interface BizIndexStats {
   rows: number;
+  /** 枚举字段 → 该字段有多少个不同取值（位图数） */
   enums: Record<string, number>;
+  /** 数值字段名 */
   nums: string[];
   bitmaps: number;
+  /**
+   * 枚举字段 → 出现过的值（升序）。
+   * 存在的理由很具体：UI 的查询构建器要列出「可选的值」，而位图只有 value→bitmap
+   * 的映射、没有顺序保证，让每个客户端自己遍历一遍是重复劳动。
+   */
+  enumValues: Record<string, string[]>;
 }
 
 interface EnumCol {
@@ -173,12 +181,14 @@ export class BizIndex {
 
   stats(): BizIndexStats {
     const enums: Record<string, number> = {};
+    const enumValues: Record<string, string[]> = {};
     let bitmaps = 0;
     for (const [f, col] of Object.entries(this.enums)) {
       enums[f] = col.bitmaps.size;
       bitmaps += col.bitmaps.size;
+      enumValues[f] = [...col.bitmaps.keys()].sort();
     }
-    return { rows: this.size, enums, nums: Object.keys(this.nums), bitmaps };
+    return { rows: this.size, enums, nums: Object.keys(this.nums), bitmaps, enumValues };
   }
 
   // ---------------- 内部 ----------------
@@ -211,6 +221,75 @@ export class BizIndex {
     }
   }
 
+  // ---------------- 快照 ----------------
+  //
+  // 索引全在内存里，重建一次 3 万行要 90ms 上下（位图逐个 set + 数值列逐个写）。
+  // 快照把「已经建好的结构」按原样存下来：位图是 Uint32Array、数值列是 Float64Array，
+  // 都是可以直接按字节存取的连续内存，不需要任何二次编码。
+  //
+  // 返回的都是内部引用（不复制）：快照编码是只读遍历，复制一遍 3 万个 key 反而更慢。
+
+  /** 快照用：rowid → key（只吐存活的） */
+  *snapshotRows(): Generator<readonly [number, string]> {
+    for (let r = 0; r < this.keys.length; r++) {
+      if (!this.alive.get(r)) continue;
+      yield [r, this.keys[r]!];
+    }
+  }
+
+  snapshotEnums(): Array<{ field: string; values: Array<{ value: string; bitmap: Bitmap }> }> {
+    return Object.entries(this.enums).map(([field, col]) => ({
+      field,
+      values: [...col.bitmaps].map(([value, bitmap]) => ({ value, bitmap })),
+    }));
+  }
+
+  snapshotNums(): Array<{ field: string; data: Float64Array }> {
+    return Object.entries(this.nums).map(([field, col]) => ({ field, data: col.data }));
+  }
+
+  snapshotAlive(): Bitmap {
+    return this.alive;
+  }
+
+  snapshotState(): { nextRowid: number; liveCount: number; capacity: number } {
+    return { nextRowid: this.nextRowid, liveCount: this.liveCount, capacity: this.capacity };
+  }
+
+  /**
+   * 从快照整体替换当前索引。先清空再装，保证「快照里没有的」不会残留在内存里。
+   *
+   * `keys` 按 rowid 索引（稀疏，洞 = 删掉的行），装入时不依赖 put 的分配逻辑：
+   * rowid 由快照给定，`nextRowid` 也由快照给定，所以之后新增的行不会跟老行撞号。
+   */
+  restoreSnapshot(s: {
+    keys: readonly (string | undefined)[];
+    enums: Array<{ field: string; values: Array<{ value: string; bitmap: Bitmap }> }>;
+    nums: Array<{ field: string; data: Float64Array }>;
+    alive: Bitmap;
+    state: { nextRowid: number; liveCount: number; capacity: number };
+  }): void {
+    this.rowids.clear();
+    this.keys = [];
+    this.enums = {};
+    this.nums = {};
+    this.alive = s.alive;
+    this.capacity = s.state.capacity;
+    this.nextRowid = s.state.nextRowid;
+    this.liveCount = s.state.liveCount;
+    for (let r = 0; r < s.keys.length; r++) {
+      const k = s.keys[r];
+      if (k === undefined) continue;
+      this.keys[r] = k;
+      this.rowids.set(k, r);
+    }
+    for (const col of s.enums) {
+      const bitmaps = new Map<string, Bitmap>();
+      for (const v of col.values) bitmaps.set(v.value, v.bitmap);
+      this.enums[col.field] = { kind: 'enum', bitmaps };
+    }
+    for (const col of s.nums) this.nums[col.field] = { kind: 'num', data: col.data };
+  }
 }
 
 /** 全表扫描（测试用基准实现）：结果必须与 query 完全一致 */
