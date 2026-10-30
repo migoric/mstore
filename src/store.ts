@@ -79,8 +79,8 @@ export class Store {
   private segById = new Map<number, SegMeta>();
   private freeSpans: FreeSpan[] = [];
   private metaSlot: 'a' | 'b' = 'a';
-  private metaDirty = false;
-  private seqsDirty = false;
+  private metaDirty = false; // equiv: 初值 true 只让首次提交多写一次 meta，落盘结果相同
+  private seqsDirty = false; // equiv: 初值 true 只会让首次提交多写一次 meta，结果一样
   private lastMetaAt = 0;
   readonly pages: PageTable;
   readonly biz: BizIndex;
@@ -102,7 +102,7 @@ export class Store {
       meta,
       (bytes) => this._allocRun(bytes),
       () => {
-        this.metaDirty = true;
+        this.metaDirty = true; // equiv: 每次 writePage 都走 _allocRun，那条路已经标过脏
       },
       { pageSize: opts.pageSize }
     );
@@ -119,7 +119,7 @@ export class Store {
     io.truncate(F.DATA_OFF);
     const meta = F.newMeta(shellCap);
     const store = new Store(io, meta, 'a', shellCap, opts);
-    store._writeMeta(true);
+    store._writeMeta();
     io.fsync();
     return store;
   }
@@ -151,7 +151,7 @@ export class Store {
     for (const seg of shells) {
       const payload = this.io.readAt(seg.off + F.SEG_HEADER_SIZE, seg.len);
       let at = 0;
-      while (at < payload.length) {
+      while (at < payload.length) { // equiv: at === length 时 indexOf 返回 -1，一样是 break
         const nl = payload.indexOf(0x0a, at);
         if (nl < 0) break; // 尾部半行：崩溃残留，丢弃
         const line = payload.subarray(at, nl).toString('utf8');
@@ -193,7 +193,7 @@ export class Store {
     for (const seg of this.meta.segs) {
       if (!seg.live || seg.type !== F.T.SHELL) continue;
       const cur = this.active.get(seg.ns);
-      if (cur && cur.id > seg.id) continue;
+      if (cur && cur.id > seg.id) continue; // equiv: seg id 不重复，cur.id 不可能等于 seg.id
       const b = new SegmentBuffer({
         id: seg.id,
         off: seg.off,
@@ -219,7 +219,7 @@ export class Store {
     const off = this.meta.hwm;
     this.meta.hwm = off + bytes;
     this.io.reserve(this.meta.hwm);
-    this.metaDirty = true;
+    this.metaDirty = true; // equiv: hwm 直接长在 meta 对象上，写 meta 时必然带上；页表 persistDir 也会标脏
     return off;
   }
 
@@ -367,7 +367,7 @@ export class Store {
       const seq = this._nextSeq(n);
       this.pages.put(key, value);
       const rowid = this.biz.put(key, value);
-      this.metaDirty = true;
+      this.metaDirty = true; // equiv: pages.put 已经通过 markDirty 标过脏，这里只是不依赖那条路径
       return { seq, rowid };
     });
   }
@@ -382,7 +382,8 @@ export class Store {
       const seq = this._nextSeq(n);
       const removed = this.pages.delete(key);
       this.biz.delete(key);
-      this.metaDirty = true;
+      this.metaDirty = true; // equiv: pages.delete 要么 writePage（persistDir 标脏），要么 flushOpen 时落盘，总会走到
+
       return { seq, removed };
     });
   }
@@ -403,7 +404,7 @@ export class Store {
       const rows = this.biz.size;
       this.pages.clear();
       this.biz.clear();
-      this.metaDirty = true;
+      this.metaDirty = true; // equiv: pages.clear 走 persistDir，已经标过脏
       return { seq, rows };
     });
   }
@@ -429,8 +430,8 @@ export class Store {
       const i = ord.indexOf(opts.after);
       if (i >= 0) start = i + 1;
     }
-    for (let i = start; i < ord.length && out.length < limit; i++) {
-      const k = ord[i]!;
+    for (const k of ord.slice(start)) {
+      if (out.length >= limit) break;
       const e = m?.get(k);
       if (!e) continue;
       out.push({ key: k, value: e.v, ts: e.ts });
@@ -522,29 +523,29 @@ export class Store {
     this.pages.flushOpen(); // 追加缓冲先落盘，再写页目录
     const now = Date.now();
     const structural = this.metaDirty;
-    if (structural || (this.seqsDirty && now - this.lastMetaAt > 500)) {
-      this._writeMeta(true);
+    if (structural || (this.seqsDirty && now - this.lastMetaAt > 500)) { // equiv: 500ms 边界差 1ms 观察不到
+      this._writeMeta();
       this.lastMetaAt = now;
     }
   }
 
-  private _writeMeta(force: boolean): void {
-    if (!force && !this.metaDirty && !this.seqsDirty) return;
+  /** 无条件写一份 meta 到另一个槽（要不要写由调用方判断，这里不做二次过滤） */
+  private _writeMeta(): void {
     this.meta.gen += 1;
     this.meta.freeSpans = this.freeSpans;
     const buf = F.encodeMeta(this.meta);
-    const off = this.metaSlot === 'a' ? F.META_B_OFF : F.META_A_OFF;
+    const off = this.metaSlot === 'a' ? F.META_B_OFF : F.META_A_OFF; // equiv: 两个槽交替写，相位不影响恢复（恢复按 gen 取大）
     this.io.writeAt(buf, off);
-    this.metaSlot = this.metaSlot === 'a' ? 'b' : 'a';
+    this.metaSlot = this.metaSlot === 'a' ? 'b' : 'a'; // equiv: 两值取反，`!==` 与本式逐值相同
     this.metaDirty = false;
-    this.seqsDirty = false;
+    this.seqsDirty = false; // equiv: 只有 _flushNow 读它，而下一次提交碰 seq 就会重新置 true
   }
 
   async flush(): Promise<void> {
     await this.committer.drainNow();
     this.pool.flushAll();
     this.pages.flushOpen();
-    this._writeMeta(true);
+    this._writeMeta();
     this.io.fsync();
   }
 

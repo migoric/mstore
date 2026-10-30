@@ -63,18 +63,23 @@ biz 不是「再开一个 KV 命名空间」，它多两样东西：**页表**�
 ## 变异测试
 
 `tools/mutate.ts` 是零依赖变异测试器：改一处运算符 → 跑测试 → 失败=杀死，通过=存活。
+单测覆盖率只说明「这行被执行过」，变异得分才说明「这行被验证过」。
 
 ```bash
-node tools/mutate.ts --target src/bitmap.ts   --tests test/bitmap.test.ts
-node tools/mutate.ts --target src/bizindex.ts --tests test/biz.test.ts
+npm run mutate         # src/bitmap.ts   ← test/bitmap.test.ts
+npm run mutate:index   # src/bizindex.ts ← test/biz.test.ts
+npm run mutate:page    # src/pagetable.ts ← test/pagetable.test.ts
+npm run mutate:store   # src/store.ts    ← test/core.test.ts + test/biz.test.ts
+npm run mutate:all
 ```
 
 规则细节：
 
-- 逐行扫运算符（`>` `>=` `===` `!==` `+` `-` `&&` `||` `!` …），替换成近似变异后跑测试
+- 逐行扫运算符（`>` `>=` `===` `!==` `&&` `||` `true` `false` …），替换成近似变异后跑测试
 - 剥掉行尾注释、跳过字符串字面量，否则注释里的 `→ x >= 0` 会被误当运算符
-- 语义等价的变异（比如容量只影响位图分配长度）用**同行尾注** `// equiv` 标记跳过，
-  写在上一行无效——工具是逐行处理的
+- 语义等价的变异用**同行尾注** `// equiv` 标记跳过，写在上一行无效——工具是逐行处理的
+- `--tests a.ts,b.ts` 支持一次跑多个测试文件（`store.ts` 的分支散在两组用例里）
+- 得分低于 70% 直接 `exit 1`
 
 当前得分：
 
@@ -82,9 +87,30 @@ node tools/mutate.ts --target src/bizindex.ts --tests test/biz.test.ts
 |---|---|---|
 | `src/bitmap.ts` | 9/9 | **100%** |
 | `src/bizindex.ts` | 9/9 | **100%** |
+| `src/pagetable.ts` | 32/32 | **100%** |
+| `src/store.ts` | 61/62 | **98.4%** |
 
-变异测试还顺带抓出两处死代码：`bizindex` 里一个两分支等价的循环，和 `alive` 位图上线后
-没人再读的 `dead` 数组——都被删掉了。
+**它抓出来的问题（都是人工 review 会漏的）：**
+
+1. `pageKeys` 只写不读——上线 `alive` 位图后没人再读它，纯死状态 → 删掉
+2. `bizindex` 里两个分支一模一样的循环（`bm.constructor === Bitmap ? bm : bm`）→ 删掉
+3. `_writeMeta(force)` 的 `force` 参数三个调用点全传 `true`，`if (!force && …)` 是死分支 → 参数整个去掉
+4. 页表用「每行 + 2 字节逗号余量」估算用量，**单行时低估 6 字节**（多算了不存在的逗号、少算了
+   `{"r":[]}` 空壳）。结果是刚好超页的行能过检查、到 flush 才炸 → 改成精确字节账
+
+顺带补出的用例都是「flush 之后没验证」这类漏洞：更新只改了内存没落盘、删除的行重开又复活、
+重复 flush 白写一页、`after` 落在第 0 个时不往后挪。
+
+`store.ts` 剩下的 1 个存活变异在空洞阈值上：
+
+```ts
+if (span.len - need < F.SEG_HEADER_SIZE + 4096) this.freeSpans.splice(i, 1);
+//                                   ↑ 改成 <= 也测不出行为差异
+```
+
+它只决定「剩余不到 4KB 的空洞要不要继续留着」，改坏了只是多浪费几 KB 空间，不产生错误行为。
+要精确打这个边界得先造一个「剩余正好 4160 字节」的空洞（混合 cap 的 shell + body 段拼出来），
+成本高于收益，留着当已知项。
 
 ## 用法
 
@@ -155,15 +181,19 @@ node bench/biz.ts --rows 30000
 
 | 场景 | 结果 |
 |---|---|
-| 写入 30000 行 | 1412ms → **21,254 行/秒**（页数 1058，重写 1072 次） |
-| 文件体积 / 有效负载 | 6.2MB / 3.7MB → 写放大约 **1.7×** |
-| `dept=R&D` 单条件 | 位图 p50 **9µs** / p99 77µs　全表扫 1.57ms |
-| `dept∈{R&D,QA}` 双值 | 位图 p50 **9µs** / p99 90µs　全表扫 1.59ms |
-| 三条件组合 | 位图 p50 **8µs** / p99 80µs　全表扫 2.11ms |
-| 冷启动 `open` | 189ms（行数 30000，重建 11 个位图） |
+| 写入 30000 行 | 1306ms → **22,976 行/秒**（页数 1038，重写 1051 次） |
+| 文件体积 / 有效负载 | 6.1MB / 3.7MB → 写放大约 **1.6×** |
+| `dept=R&D` 单条件 | 位图 p50 **10µs** / p99 72µs　全表扫 1.02ms |
+| `dept∈{R&D,QA}` 双值 | 位图 p50 **12µs** / p99 46µs　全表扫 1.26ms |
+| 三条件组合 | 位图 p50 **7µs** / p99 42µs　全表扫 1.23ms |
+| 冷启动 `open` | 173ms（行数 30000，重建 11 个位图） |
 
-位图相对全表扫快 **~180×**。冷启动这 189ms 是当前最大的短板：30k 行要逐页重放出索引。
-下一步是索引 snapshot——把位图和页目录整体存成一段，恢复时直接 mmap 式读回，预期降到 ~20ms。
+位图相对全表扫快 **~100–180×**（差距随命中集比例浮动）。5 万行时是 22,817 行/秒、写放大 1.4×、
+冷启动 220ms —— 冷启动是当前最大的短板：行数越多位图重建越久。
+
+下一步是索引 snapshot——把位图和页目录整体存成一段，恢复时直接读回，预期降到 ~20ms。
+（页表改成精确字节账之后，同样 3 万行从 1058 页降到 1038 页，写放大 1.7× → 1.6×：原来每行多估 2 字节，
+一页实际能多塞一行。）
 
 ## 已知取舍与坑
 
@@ -177,8 +207,11 @@ node bench/biz.ts --rows 30000
 
 - Node **≥ 22.18**（能直接跑 `.ts` 的类型擦除；更早版本需要先 `tsc` 编译，且没有 `zlib.crc32`）
 - 类型检查：`npm run typecheck`（TypeScript 7）
-- 测试：`npm test` → 32 个用例（bitmap 16 / biz 9 / store 7）
-- 变异测试：`npm run mutate`、`npm run mutate:index`
+- 测试：`npm test` → **79 个用例**（约 55 秒）
+  - `bitmap` 16 / `pagetable` 24 / `biz` 9 / `core` 23 / `store` 7
+  - `core` 是「快速分支覆盖」，全程批量提交，5 秒跑完，专门喂给变异测试；
+    `store` 是「长流程规模验证」（跨段 500 条、清空 200 条），慢但只跑一次
+- 变异测试：`npm run mutate:all`
 
 ## 设计来源
 

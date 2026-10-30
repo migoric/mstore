@@ -10,6 +10,7 @@
  * 用法：
  *   node tools/mutate.ts --target src/bitmap.ts --tests test/bitmap.test.ts
  *   node tools/mutate.ts --target src/bizindex.ts --tests test/biz.test.ts --max 12
+ *   node tools/mutate.ts --target src/store.ts --tests test/core.test.ts,test/biz.test.ts
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -97,8 +98,8 @@ function collect(file: string): Mutant[] {
   return out;
 }
 
-function runTests(testFile: string, timeoutMs: number): { ok: boolean; out: string } {
-  const r = spawnSync(process.execPath, ['--test', testFile], {
+function runTests(testFiles: string[], timeoutMs: number): { ok: boolean; out: string } {
+  const r = spawnSync(process.execPath, ['--test', ...testFiles], {
     encoding: 'utf8',
     timeout: timeoutMs,
   });
@@ -112,11 +113,13 @@ function main(): void {
   const max = Number(arg('--max', '100'));
   const timeoutMs = Number(arg('--timeout', '120000'));
   if (!target || !tests) {
-    console.error('用法: node tools/mutate.ts --target <file> --tests <testfile> [--max N]');
+    console.error('用法: node tools/mutate.ts --target <file> --tests <a.ts[,b.ts]> [--max N]');
     process.exit(2);
   }
-  if (!fs.existsSync(target) || !fs.existsSync(tests)) {
-    console.error('文件不存在:', !fs.existsSync(target) ? target : tests);
+  const testFiles = tests.split(',').map((s) => s.trim()).filter(Boolean);
+  for (const f of [target, ...testFiles]) {
+    if (fs.existsSync(f)) continue;
+    console.error('文件不存在:', f);
     process.exit(2);
   }
 
@@ -127,11 +130,11 @@ function main(): void {
   const step = Math.max(1, Math.ceil(all.length / max));
   const picked = all.filter((_, i) => i % step === 0).slice(0, max);
 
-  console.log(`变异测试  target=${path.basename(target)}  tests=${path.basename(tests)}`);
+  console.log(`变异测试  target=${path.basename(target)}  tests=${testFiles.map((f) => path.basename(f)).join('+')}`);
   console.log(`候选 ${all.length} 个，抽样 ${picked.length} 个\n`);
 
   // 基线：未变异时必须全绿，否则后面结论无意义
-  const base = runTests(tests, timeoutMs);
+  const base = runTests(testFiles, timeoutMs);
   if (!base.ok) {
     console.error('[中止] 基线测试没通过，先修测试再跑变异。');
     console.error(base.out.split('\n').filter((l) => l.includes('not ok')).slice(0, 5).join('\n'));
@@ -148,7 +151,7 @@ function main(): void {
     fs.writeFileSync(target, mutated.join('\n'));
     let res: { ok: boolean; out: string };
     try {
-      res = runTests(tests, timeoutMs);
+      res = runTests(testFiles, timeoutMs);
     } finally {
       fs.writeFileSync(target, original);
     }
