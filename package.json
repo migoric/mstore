@@ -1,0 +1,40 @@
+{
+  "name": "mstore",
+  "version": "0.1.0",
+  "description": "Single-file local data store for Node: segment table + CRC + group commit, zero dependencies, TypeScript source run directly by Node.",
+  "type": "module",
+  "bin": {
+    "mstore": "./cli.ts"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "cli.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --test test/store.test.ts",
+    "gen": "node bench/gen.ts",
+    "bench": "node bench/bench.ts"
+  },
+  "keywords": [
+    "storage",
+    "embedded",
+    "single-file",
+    "group-commit",
+    "local-first",
+    "typescript"
+  ],
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^7.0.2"
+  },
+  "license": "MIT"
+}
