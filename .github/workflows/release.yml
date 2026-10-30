@@ -95,21 +95,21 @@ jobs:
           set -euo pipefail
           ver="$(node -p 'require("./package.json").version')"
           cat > /tmp/notes.md <<EOF
-          Node ${ver} 版内核。零依赖，\`src/**/*.ts\` 由 Node 直接执行（类型擦除），无构建步骤。
+          mstore ${ver} —— 单文件嵌入式存储的 Node 内核。零依赖，
+          \`src/**/*.ts\` 由 Node 直接执行（类型擦除），无构建步骤。
 
           ## 安装
 
-          \`\`\`
-          npm i mstore@${ver}
-          \`\`\`
-
-          或从下方附件下载 \`mstore-${ver}.tgz\`：
+          **暂未发布到 npm registry。** 包名 \`mstore\` 在 registry 上被他人占用
+          （\`npm view mstore\` 是别人的 0.0.1），所以 \`npm i mstore\` 装的不是这个项目。
+          目前只从 GitHub Release 分发：
 
           \`\`\`
           npm i ./mstore-${ver}.tgz
           \`\`\`
 
-          要求 Node ≥ 22.18（需要 \`--experimental-strip-types\` 之后的默认类型擦除）。
+          或直接 clone 仓库跑 \`node cli.ts\`。要求 Node ≥ 22.18
+          （需要类型擦除与 \`zlib.crc32\`）。
 
           ## 用法
 

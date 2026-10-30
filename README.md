@@ -173,6 +173,10 @@ await db.close();
 - Node **≥ 22.18**（能直接跑 `.ts` 的类型擦除；更早版本没有 `zlib.crc32`）
 - macOS 客户端：[`mstore-db`](https://github.com/migoric/mstore-db)
 
+**尚未发布到 npm registry。** 包名 `mstore` 在 registry 上被他人占用
+（`npm view mstore` 是别人的 0.0.1），所以 `npm i mstore` 装的不是这个项目。
+用 GitHub Release 里的 `mstore-*.tgz`，或直接 clone 本仓库。
+
 ```bash
 npm run typecheck    # TypeScript 7
 npm test             # 122 个用例，约 58s
