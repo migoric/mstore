@@ -72,6 +72,10 @@ async function main(): Promise<void> {
   ];
 
   for (const c of cases) {
+    // 预热 200 次丢弃：第一次查询走的是还没被 JIT 编译的路径，
+    // 不预热的话 p50 会被那几十微秒的编译时间抬高。
+    for (let i = 0; i < 200; i++) db.bizQuery({ ...c.filter, limit: 50 });
+
     const lat: number[] = [];
     let hits = 0;
     for (let i = 0; i < QUERY_ITERS; i++) {
@@ -91,15 +95,28 @@ async function main(): Promise<void> {
     );
   }
 
-  console.log('\n=== 冷启动（从页表重建位图索引）===');
+  console.log('\n=== 冷启动（关掉再开，量两条路）===');
   await db.close();
-  const t2 = performance.now();
-  db = Store.open(file);
-  const openMs = performance.now() - t2;
-  console.log(`  open ${openMs.toFixed(0)} ms  行数 ${db.biz.size}  位图 ${db.bizStats().index.bitmaps} 个`);
 
+  const open1At = performance.now();
+  db = Store.open(file);
+  const wall1 = performance.now() - open1At;
+  const s1 = db.stats().snapshot;
+  console.log(
+    `  第 1 次（进程内首次，含 JIT 编译）  ${wall1.toFixed(0)} ms  走 ${db.openPath}` +
+      `${s1.note ? ` — ${s1.note}` : ''}  行 ${db.biz.size}  位图 ${db.bizStats().index.bitmaps} 个`
+  );
+  if (db.openPath !== 'snapshot') {
+    console.log('  ⚠ 没命中索引快照：这份库走的是逐页重放，下面的数字不是快照的成本');
+  }
   const q = db.bizQuery({ eq: { dept: 'QA' }, gte: { level: 3 } }).keys;
   console.log(`  重开后的查询仍可用：${q.length} 条`);
+  await db.close();
+
+  const open2At = performance.now();
+  db = Store.open(file);
+  const wall2 = performance.now() - open2At;
+  console.log(`  第 2 次（JIT 已热，稳态）          ${wall2.toFixed(0)} ms  走 ${db.openPath}  行 ${db.biz.size}`);
   await db.close();
   fs.rmSync(dir, { recursive: true, force: true });
 }

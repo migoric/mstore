@@ -1,11 +1,16 @@
 /**
  * 冷启动对比：索引快照 vs 逐页重放。
  *
- *   node bench/open.ts [--rows 30000] [--keep]
+ *   node bench/open.ts [--rows 30000] [--rounds 3] [--keep]
  *
  * 只做一件事：同一份数据用两条路打开，比 open 耗时，并验证两条路的查询结果完全相同。
  * 「结果一致」这条断言比耗时更重要——快照一旦和重放不一致，就是数据正确性问题，
  * 不是性能问题了。
+ *
+ * 两条测量纪律（踩过才知道）：
+ *   1. 每一轮必须 `await close()`。早先这里写的是 `void close()`，于是下一轮 open
+ *      和上一轮的「写快照 + 写 meta」并发跑，量出来的是 I/O 竞争，不是冷启动。
+ *   2. 先跑一轮丢弃做预热。第一轮的 JIT 编译时间会算进 openMs，30k 行能差 17ms。
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -19,6 +24,7 @@ const arg = (name: string, dflt: string): string => {
 };
 
 const ROWS = Number(arg('rows', '30000'));
+const ROUNDS = Math.max(1, Number(arg('rounds', '3')));
 const KEEP = process.argv.includes('--keep');
 
 const DEPTS = ['R&D', 'Design', 'QA', 'Ops', 'Sales'];
@@ -60,30 +66,65 @@ const FILTERS: Filter[] = [
   { gte: { salary: 12000 }, lte: { salary: 20000 } },
 ];
 
-const run = (snapshot: boolean): { ms: number; path: string; note: string; results: string[] } => {
+interface Round {
+  ms: number;
+  path: string;
+  note: string;
+  results: string[];
+}
+
+const run = async (snapshot: boolean): Promise<Round> => {
   const s = Store.open(file, { snapshot });
   const st = s.stats();
   const results = FILTERS.map((f) => s.bizQuery(f).keys.join());
   const out = { ms: st.snapshot.openMs, path: s.openPath, note: st.snapshot.note, results };
-  // close 会重写快照，这里只是为了让下一次 open 的状态可预测
-  void s.close();
+  // 必须等它关完：close 里要写 meta 和快照，不等就会和下一轮 open 抢 I/O
+  await s.close();
   return out;
 };
 
-const withSnap = run(true);
-const noSnap = run(false);
+const median = (xs: number[]): number => {
+  const s = [...xs].sort((a, b) => a - b);
+  return s[Math.floor(s.length / 2)]!;
+};
+
+// 预热一轮丢弃：JIT + 文件页缓存
+await run(true);
+await run(false);
+
+const snaps: Round[] = [];
+const replays: Round[] = [];
+for (let r = 0; r < ROUNDS; r++) {
+  snaps.push(await run(true));
+  replays.push(await run(false));
+}
 
 console.log('');
-console.log('路径        耗时        说明');
-console.log(`快照        ${withSnap.ms.toFixed(2).padStart(7)}ms   ${withSnap.path}${withSnap.note ? ` (${withSnap.note})` : ''}`);
-console.log(`重放        ${noSnap.ms.toFixed(2).padStart(7)}ms   ${noSnap.path}${noSnap.note ? ` (${noSnap.note})` : ''}`);
-console.log(`加速        ${(noSnap.ms / withSnap.ms).toFixed(1)}×`);
+console.log(`路径        中位耗时      各轮                         说明`);
+for (const [label, rounds] of [
+  ['快照', snaps],
+  ['重放', replays],
+] as const) {
+  const times = rounds.map((x) => x.ms);
+  const detail = times.map((t) => t.toFixed(1)).join(' / ');
+  const first = rounds[0]!;
+  console.log(
+    `${label}        ${`${median(times).toFixed(2)}ms`.padStart(7)}       ${detail.padEnd(24)}   ` +
+      `${first.path}${first.note ? ` (${first.note})` : ''}`
+  );
+}
+const speedup = median(replays.map((x) => x.ms)) / median(snaps.map((x) => x.ms));
+console.log(`加速        ${speedup.toFixed(1)}×（按中位数）`);
 
 let same = true;
-for (let i = 0; i < FILTERS.length; i++) {
-  if (withSnap.results[i] !== noSnap.results[i]) same = false;
+for (const r of [...snaps, ...replays]) {
+  for (let i = 0; i < FILTERS.length; i++) {
+    if (r.results[i] !== snaps[0]!.results[i]) same = false;
+  }
 }
-console.log(`结果一致    ${same ? '是（5 组筛选器逐字节相同）' : '否 —— 这是 bug，先修再谈性能'}`);
+console.log(
+  `结果一致    ${same ? `是（${FILTERS.length} 组筛选器 × ${ROUNDS + 1} 轮，逐字节相同）` : '否 —— 这是 bug，先修再谈性能'}`
+);
 
 if (!KEEP) fs.rmSync(dir, { recursive: true, force: true });
 else console.log(`保留 ${file}`);

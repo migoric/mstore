@@ -13,6 +13,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { Store } from '../src/store.ts';
 import { crc32Impl } from '../src/crc32.ts';
+import type { Locator } from '../src/types.ts';
 
 const MB = 1048576;
 const arg = (k: string, d: string): string => {
@@ -73,35 +74,72 @@ async function benchReads(file: string): Promise<void> {
   const st = db.stats();
   console.log(`  冷启动 open: ${openMs.toFixed(1)} ms  (重放 ${st.records.capture ?? 0} 抓包 + ${st.records.agent ?? 0} run + ${st.records.biz ?? 0} 业务)`);
 
-  const n = 20000;
-  const lat: number[] = [];
-  for (let i = 0; i < n; i++) {
-    const key = `c_${i % 5000}`;
-    const t = performance.now();
-    db.get('capture', key);
-    lat.push(performance.now() - t);
+  // 曾经这里不检查数据是否存在：库里的 capture 是 0 条，于是 20000 次点查全部
+  // 走 miss 分支（返回 null 极快），报出 p50=0µs —— 看起来快得不真实，实际什么都没测到。
+  const keys = db.list('capture', { limit: 500 }).map((r) => r.key);
+  if (keys.length === 0) {
+    await db.close();
+    throw new Error(
+      '这个库里没有 capture 记录：点查与列表会全部 miss，量到的不是读延迟。\n' +
+        '  先造数据: node bench/gen.ts --out <file> --cap 5000'
+    );
   }
-  console.log(`  点查 ${n} 次: p50=${fmt(pct(lat, 50))} p99=${fmt(pct(lat, 99))}`);
+
+  const n = 20000;
+  // performance.now() 在 macOS 上的分辨率约 1µs（实测读数会被 round 到整数微秒），
+  // 单次点查是纯内存 Map.get，落在 0 —— 早先这里报的是「p50=0µs」，
+  // 看着惊人其实什么都没测到。改成批内累加：每批 2000 次测总时长，再折算到 ns/op。
+  const BATCH = 2000;
+  const batches = Math.floor(n / BATCH);
+  for (let i = 0; i < n; i++) db.get('capture', keys[i % keys.length]!); // 预热
+  const perOp: number[] = [];
+  for (let b = 0; b < batches; b++) {
+    const t = performance.now();
+    for (let i = 0; i < BATCH; i++) {
+      const e = db.get('capture', keys[(b * BATCH + i) % keys.length]!);
+      if (!e) throw new Error('点查 miss：list 里有、get 拿不到');
+    }
+    perOp.push(((performance.now() - t) * 1e6) / BATCH); // ns/op
+  }
+  const nsFmt = (x: number): string => (x < 1000 ? `${x.toFixed(0)} ns` : `${(x / 1000).toFixed(2)} µs`);
+  console.log(
+    `  点查 ${n} 次（${keys.length} 个真实 key，每批 ${BATCH}）: p50=${nsFmt(pct(perOp, 50))} p99=${nsFmt(pct(perOp, 99))}`
+  );
 
   const lat2: number[] = [];
   for (let i = 0; i < 2000; i++) {
+    const after = keys[(i * 37) % keys.length]!;
     const t = performance.now();
-    db.list('capture', { limit: 50, after: `c_${i}` });
+    const rows = db.list('capture', { limit: 50, after });
+    if (rows.length === 0) throw new Error(`列表为空：after=${after}`);
     lat2.push(performance.now() - t);
   }
   console.log(`  列表 50 条 ×2000: p50=${fmt(pct(lat2, 50))} p99=${fmt(pct(lat2, 99))}`);
 
   console.log('\n=== 3. body 直读（原样字节，不 parse）===');
-  for (const key of ['c_0', 'c_20', 'run_0']) {
-    const e = db.get(key.startsWith('run') ? 'agent' : 'capture', key);
+  // 挑最小的一个 capture body：大的那个（agent run）单独列，避免两件事混在一起
+  let smallest: { key: string; loc: Locator } | null = null;
+  for (const key of keys) {
+    const e = db.get('capture', key);
     if (!e?.b) continue;
+    if (!smallest || e.b.l < smallest.loc.l) smallest = { key, loc: e.b };
+  }
+  const targets: Array<{ key: string; loc: Locator }> = [];
+  if (smallest) targets.push(smallest);
+  const run = db.get('agent', 'run_0');
+  if (run?.b) targets.push({ key: 'run_0', loc: run.b });
+
+  if (targets.length === 0) throw new Error('没有可直读的 body');
+  for (const { key, loc } of targets) {
     const lat3: number[] = [];
     for (let i = 0; i < 200; i++) {
       const t = performance.now();
-      db.bodyAt(e.b);
+      db.bodyAt(loc);
       lat3.push(performance.now() - t);
     }
-    console.log(`  ${key.padEnd(6)} ${String((e.b.l / 1024).toFixed(0)).padStart(6)} KB: p50=${fmt(pct(lat3, 50))} p99=${fmt(pct(lat3, 99))}`);
+    console.log(
+      `  ${key.padEnd(8)} ${String((loc.l / 1024).toFixed(0)).padStart(6)} KB: p50=${fmt(pct(lat3, 50))} p99=${fmt(pct(lat3, 99))}`
+    );
   }
 
   await db.close();
@@ -109,19 +147,31 @@ async function benchReads(file: string): Promise<void> {
 
 async function benchClear(file: string): Promise<void> {
   console.log('\n=== 4. 清空 capture（段标记 + 尾部截断）===');
-  const db = Store.open(file);
-  const before = fs.statSync(file).size;
+  // 在副本上清空。早先直接清原库，后果有两个：压测库被永久破坏（第二次跑 bench 时
+  // capture 已经是 0 条，报出「清空 0 条」还以为是 O(段数) 快得不真实），
+  // 而且得重跑 gen 才能再测一次。压测不该有副作用。
+  const copy = path.join(tmp, 'clear.db');
+  fs.copyFileSync(file, copy);
+  const db = Store.open(copy);
+  const before = fs.statSync(copy).size;
   const beforeRec = db.count('capture');
+  if (beforeRec === 0) {
+    await db.close();
+    throw new Error('副本里 capture 也是 0 条：请重新 node bench/gen.ts 造库');
+  }
   const t0 = performance.now();
   const r = await db.clearNs('capture');
   const ms = performance.now() - t0;
-  const after = fs.statSync(file).size;
+  const after = fs.statSync(copy).size;
   console.log(
     `  清空 ${beforeRec} 条: ${ms.toFixed(2)} ms  段 dead=${r.deadSegs} 截断=${r.truncated}  文件 ${(before / MB).toFixed(1)}MB → ${(after / MB).toFixed(1)}MB`
   );
   const c = db.check();
   console.log(`  自检: ok=${c.ok} issues=${c.issues.length}`);
+  const left = db.count('capture');
+  console.log(`  清空后剩余 ${left} 条（应为 0）`);
   await db.close();
+  fs.rmSync(copy, { force: true });
 }
 
 function report(file: string): void {

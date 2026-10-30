@@ -173,6 +173,11 @@ npm run demo               # 小样本演示
 | KV 索引仍走逐页重放 | `capture` / `mock` / `agent` 三个 ns 每次打开都重放 shell 段。块格式已带 tag，加 `KV` 块不用升版本，但还没做 |
 | `F_PUNCHHOLE` 需要 C helper | 当前用 `ftruncate` 回收尾部死段；中间空洞要靠 `fcntl(F_PUNCHHOLE)`，Node 没有，得编译一个小 `.node`。`reclaim` 命令检测 `MSTORE_PUNCH_HELPER` 环境变量 |
 | 段头读错 1 字节就炸 | 块头是 `[tag u8][pad u8][pad u16][len u32]`，共 8 字节。少读一个 pad 会导致 `seek past end (1371509067 > 1966466)` 这种天文数字报错——看到这种错误先数字节 |
+| 快照在 10 万行级别失去线性 | 10k/30k/50k 是 20/36/48ms（约 0.6ms/千行），100k 跳到 178ms、加速比从 5.2× 回落 3.3×，各轮波动 105–190ms。原因：10 万个 key 字符串 + 两遍 Map 插入撞上 V8 老生代 GC。要往上走得改成「偏移表 + 共享字符串池」 |
+| `void close()` 会污染下一次测量 | 笔测脚本里写 `void s.close()`，下一轮 `open` 与上一轮的「写快照 + 写 meta」并发跑，量到的是 I/O 竞争。**压测里每一轮都要 `await close()`** |
+| 压测不能改原库 | `bench/bench.ts` 曾在 `data/bench.db` 上直接 `clearNs('capture')`：第二次跑就空转，报「清空 0 条」还以为快得不真实，而且库被永久破坏。现在清空在副本上做 |
+| `p50=0µs` 是假象 | `performance.now()` 在 macOS 上分辨率约 1µs，纯内存点查落在 0。必须**批内累加再折算 ns/op**（每批 2000 次）。真实值是 p50 82ns / p99 156ns |
+| 空 ns 的读压测没有意义 | 点查 `get('capture', k)` 在 capture 为空时全部 miss，返回 null 极快——报出来的延迟测的是 miss 分支。压测前必须断言数据非空，并用 `list()` 拿真实 key |
 
 ## 提交规范
 
