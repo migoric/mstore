@@ -69,10 +69,17 @@ jobs:
           mkdir -p dist
           npm pack --pack-destination dist
           cd dist && sha256sum ./*.tgz | tee ./SHA256SUMS
-          # 包里必须有 cli.ts 和 src/，否则 bin 装出来是空的
-          tar -tzf ./*.tgz | grep -qx 'package/cli.ts'
-          tar -tzf ./*.tgz | grep -q '^package/src/index.ts$'
-          tar -tzf ./*.tgz | wc -l
+
+          # 先落盘再检查，不要 `tar -tzf ... | grep -q`。
+          # grep -q 命中即退出并关掉管道，tar 继续写会拿到 EPIPE，
+          # 在 `set -o pipefail` 下这条管道整体算失败——报错是
+          # 「tar: stdout: write error」，跟「包里缺文件」毫无关系。
+          tar -tzf ./*.tgz > /tmp/packlist.txt
+          grep -qx 'package/cli.ts' /tmp/packlist.txt \
+            || { echo "::error::包里没有 cli.ts，bin 装出来会是空的"; exit 1; }
+          grep -qx 'package/src/index.ts' /tmp/packlist.txt \
+            || { echo "::error::包里没有 src/index.ts"; exit 1; }
+          echo "包内 $(wc -l < /tmp/packlist.txt) 个文件"
 
       - uses: actions/upload-artifact@v4
         with:
