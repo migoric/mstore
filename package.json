@@ -20,7 +20,9 @@
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
-    "test": "node --test test/store.test.ts",
+    "test": "node --test test/bitmap.test.ts test/biz.test.ts test/store.test.ts",
+    "mutate": "node tools/mutate.ts --target src/bitmap.ts --tests test/bitmap.test.ts",
+    "mutate:index": "node tools/mutate.ts --target src/bizindex.ts --tests test/biz.test.ts",
     "gen": "node bench/gen.ts",
     "bench": "node bench/bench.ts"
   },

@@ -41,6 +41,8 @@ export interface Meta {
   pending: number[];
   /** 可复用的空洞（打洞或尾部残留产生），alloc 时 first-fit */
   freeSpans?: Array<{ off: number; len: number }>;
+  /** 业务数据页表：逻辑页号 → 物理偏移（CoW 写入，旧偏移自动成为垃圾） */
+  pageDir?: number[];
 }
 
 export interface Entry {

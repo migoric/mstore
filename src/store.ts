@@ -18,6 +18,9 @@ import { Io } from './io.ts';
 import { BufferPool, SegmentBuffer } from './bufferpool.ts';
 import { Committer } from './committer.ts';
 import { crc32, crc32Impl } from './crc32.ts';
+import { PageTable } from './pagetable.ts';
+import { BizIndex } from './bizindex.ts';
+import type { Filter } from './bizindex.ts';
 import type {
   Meta,
   SegMeta,
@@ -36,7 +39,16 @@ export interface StoreOpts {
   shellCap?: number;
   /** @deprecated 用 shellCap；保留是为了老脚本兼容 */
   segSize?: number;
+  /** 业务数据里走位图的枚举字段，默认 dept / status / type / kind */
+  bizEnumFields?: string[];
+  /** 业务数据里走数值范围的字段，默认 level / updated_at / ms / bytes */
+  bizNumFields?: string[];
+  /** 页大小（CoW 页表），默认 4096 */
+  pageSize?: number;
 }
+
+const DEFAULT_ENUM_FIELDS = ['dept', 'status', 'type', 'kind'];
+const DEFAULT_NUM_FIELDS = ['level', 'updated_at', 'ms', 'bytes'];
 
 export interface PutResult {
   seq: number;
@@ -70,8 +82,10 @@ export class Store {
   private metaDirty = false;
   private seqsDirty = false;
   private lastMetaAt = 0;
+  readonly pages: PageTable;
+  readonly biz: BizIndex;
 
-  private constructor(io: Io, meta: Meta, slot: 'a' | 'b', shellCap: number) {
+  private constructor(io: Io, meta: Meta, slot: 'a' | 'b', shellCap: number, opts: StoreOpts = {}) {
     this.io = io;
     this.meta = meta;
     this.metaSlot = slot;
@@ -83,6 +97,16 @@ export class Store {
     });
     for (const s of meta.segs) this.segById.set(s.id, s);
     this.freeSpans = meta.freeSpans ?? [];
+    this.pages = new PageTable(
+      io,
+      meta,
+      (bytes) => this._allocRun(bytes),
+      () => {
+        this.metaDirty = true;
+      },
+      { pageSize: opts.pageSize }
+    );
+    this.biz = new BizIndex(opts.bizEnumFields ?? DEFAULT_ENUM_FIELDS, opts.bizNumFields ?? DEFAULT_NUM_FIELDS);
   }
 
   // ---------------- 创建 / 打开 ----------------
@@ -94,7 +118,7 @@ export class Store {
     io.writeAt(F.encodeHeader({ segSize: shellCap, createdAt: Math.floor(Date.now() / 1000) }), 0);
     io.truncate(F.DATA_OFF);
     const meta = F.newMeta(shellCap);
-    const store = new Store(io, meta, 'a', shellCap);
+    const store = new Store(io, meta, 'a', shellCap, opts);
     store._writeMeta(true);
     io.fsync();
     return store;
@@ -111,9 +135,11 @@ export class Store {
     if (candidates.length === 0) throw new Error('both meta blocks are corrupt');
     candidates.sort((x, y) => y.meta.gen - x.meta.gen);
     const picked = candidates[0]!;
-    const store = new Store(io, picked.meta, picked.slot, opts.shellCap ?? opts.segSize ?? head.segSize ?? MB);
+    const store = new Store(io, picked.meta, picked.slot, opts.shellCap ?? opts.segSize ?? head.segSize ?? MB, opts);
     store._rebuildIndex();
     store._reopenShell();
+    store.pages.load();
+    store._rebuildBiz();
     return store;
   }
 
@@ -154,6 +180,14 @@ export class Store {
     }
   }
 
+  /** 从页表重建位图索引（页表是唯一真相，索引只是加速结构） */
+  private _rebuildBiz(): void {
+    this.biz.clear();
+    for (const [key, value] of this.pages.entries()) {
+      this.biz.put(key, value);
+    }
+  }
+
   /** 打开时把每个 ns 的最后一个 shell 段接上继续追加 */
   private _reopenShell(): void {
     for (const seg of this.meta.segs) {
@@ -180,6 +214,15 @@ export class Store {
   // ---------------- 段分配 ----------------
 
   /** 分配一段空间：优先复用空洞，否则追加到高水位 */
+  /** 在文件尾部申请一段连续空间（8 字节对齐），给页表用 */
+  private _allocRun(bytes: number): number {
+    const off = this.meta.hwm;
+    this.meta.hwm = off + bytes;
+    this.io.reserve(this.meta.hwm);
+    this.metaDirty = true;
+    return off;
+  }
+
   private _registerSeg(ns: number, type: number, cap: number, len: number, rows: number, crc: number): SegMeta {
     const need = F.SEG_HEADER_SIZE + cap;
     let off: number;
@@ -315,6 +358,56 @@ export class Store {
     return this.idx.get(F.nsId(ns))?.get(key);
   }
 
+  // ---------------- 业务数据（CoW 页表 + 位图） ----------------
+
+  /** 业务行写：页表 CoW + 位图同步更新 + 一次 group commit */
+  bizPut(key: string, value: unknown): Promise<{ seq: number; rowid: number }> {
+    const n = F.nsId('biz');
+    return this.committer.submit(() => {
+      const seq = this._nextSeq(n);
+      this.pages.put(key, value);
+      const rowid = this.biz.put(key, value);
+      this.metaDirty = true;
+      return { seq, rowid };
+    });
+  }
+
+  bizGet(key: string): unknown {
+    return this.pages.get(key);
+  }
+
+  bizDel(key: string): Promise<{ seq: number; removed: boolean }> {
+    const n = F.nsId('biz');
+    return this.committer.submit(() => {
+      const seq = this._nextSeq(n);
+      const removed = this.pages.delete(key);
+      this.biz.delete(key);
+      this.metaDirty = true;
+      return { seq, removed };
+    });
+  }
+
+  /** 固定筛选器 → 位图执行；返回 key 列表（天然按 rowid 升序） */
+  bizQuery(filter: Filter = {}): { keys: string[]; rowids: number[] } {
+    return this.biz.query(filter);
+  }
+
+  bizStats(): { pages: ReturnType<PageTable['stats']>; index: ReturnType<BizIndex['stats']> } {
+    return { pages: this.pages.stats(), index: this.biz.stats() };
+  }
+
+  bizClear(): Promise<{ seq: number; rows: number }> {
+    const n = F.nsId('biz');
+    return this.committer.submit(() => {
+      const seq = this._nextSeq(n);
+      const rows = this.biz.size;
+      this.pages.clear();
+      this.biz.clear();
+      this.metaDirty = true;
+      return { seq, rows };
+    });
+  }
+
   getBody(ns: NsName | number, key: string): Buffer | null {
     const e = this.get(ns, key);
     if (!e?.b) return null;
@@ -426,6 +519,7 @@ export class Store {
 
   private _flushNow(): void {
     this.pool.flushAll();
+    this.pages.flushOpen(); // 追加缓冲先落盘，再写页目录
     const now = Date.now();
     const structural = this.metaDirty;
     if (structural || (this.seqsDirty && now - this.lastMetaAt > 500)) {
@@ -449,6 +543,7 @@ export class Store {
   async flush(): Promise<void> {
     await this.committer.drainNow();
     this.pool.flushAll();
+    this.pages.flushOpen();
     this._writeMeta(true);
     this.io.fsync();
   }

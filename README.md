@@ -29,6 +29,63 @@ store.db
 - **shell 段用 NDJSON**：可读性红利——`store dump` 出来的就是人眼可读的行。
 - **body 段存原始字节**：不 base64、不 parse、不格式化。
 
+## 三层引擎
+
+同一份文件里住着三类数据，各自的写法和查询路径都不一样：
+
+| 数据 | 形态 | 落盘 | 查询 |
+|---|---|---|---|
+| **biz** 业务表 | 固定字段、量大、常改 | CoW 页表（4KB 页，页内 JSON 行数组） | 位图索引，p50 **8–9µs** |
+| **capture** 抓包 | 只追加、body 大、可整表清空 | NDJSON shell + body 区段 | 按 ns 段组，清空 O(段数) |
+| **agent** 执行结果 | schema 不定的大 JSON（100KB–5MB） | body 区段，精确长度、不留预留 | 一次 `pread`，不 parse |
+
+### 业务数据引擎
+
+biz 不是「再开一个 KV 命名空间」，它多两样东西：**页表**和**索引**。
+
+**CoW 页表**（`src/pagetable.ts`）：行按 4KB 页组织，页内是 `{r:[{k,v}]}` 的 JSON。
+改一行 = 整页重写到新偏移，旧页变空洞由 `reclaim` 回收。页目录 `pageDir: number[]` 存在 meta 里。
+
+只这么做写放大很难看——每行一次 4KB 重写。所以加了**追加缓冲**：新行先攒在 `openRows`，
+满页（按**字节**判断，不是按行数）或提交时才落一次盘。实测写放大从「每行 1 页」降到 **1.7×**。
+
+**位图索引**（`src/bitmap.ts` + `src/bizindex.ts`）：枚举字段建 `Uint32Array` 位图，
+数值字段建 `Float64Array`。查询是位图 `and`/`andNot`，不是全表扫。
+
+两个关键优化，都是被压测逼出来的：
+
+- **增量维护 `alive` 位图**：原本每次查询都要重建「死行集」，30k 行下光重建就吃掉 80µs。
+  改成删除时增量更新，查询直接 `acc.and(alive)`。
+- **`forEachWhile` 提前退出**：`LIMIT 50` 不需要扫完 3 万行匹配集，够了就停。
+
+两项合计把 p50 从 **85µs 打到 8–9µs**（10×）。
+
+## 变异测试
+
+`tools/mutate.ts` 是零依赖变异测试器：改一处运算符 → 跑测试 → 失败=杀死，通过=存活。
+
+```bash
+node tools/mutate.ts --target src/bitmap.ts   --tests test/bitmap.test.ts
+node tools/mutate.ts --target src/bizindex.ts --tests test/biz.test.ts
+```
+
+规则细节：
+
+- 逐行扫运算符（`>` `>=` `===` `!==` `+` `-` `&&` `||` `!` …），替换成近似变异后跑测试
+- 剥掉行尾注释、跳过字符串字面量，否则注释里的 `→ x >= 0` 会被误当运算符
+- 语义等价的变异（比如容量只影响位图分配长度）用**同行尾注** `// equiv` 标记跳过，
+  写在上一行无效——工具是逐行处理的
+
+当前得分：
+
+| 模块 | 杀死/总数 | 得分 |
+|---|---|---|
+| `src/bitmap.ts` | 9/9 | **100%** |
+| `src/bizindex.ts` | 9/9 | **100%** |
+
+变异测试还顺带抓出两处死代码：`bizindex` 里一个两分支等价的循环，和 `alive` 位图上线后
+没人再读的 `dead` 数组——都被删掉了。
+
 ## 用法
 
 ```bash
@@ -57,6 +114,20 @@ await db.clearNs('capture');     // 清空 = 标记段组
 await db.close();
 ```
 
+业务表走另一组 API（带索引维护）：
+
+```ts
+const db = Store.open('data/app.db');
+for (const u of users) db.bizPut('biz', { name: u.name, dept: u.dept, salary: u.salary });
+
+db.bizQuery('biz', { dept: 'R&D', salary: [100, 200], limit: 50 });
+// → 位图 and + 提前退出，30k 行下 p50 8–9µs
+
+db.bizGet('biz', rowid);
+await db.bizDel('biz', rowid);   // 增量更新 alive 位图，不重建
+db.bizStats('biz');              // { live, pages, rewrite, ... }
+```
+
 ## 压测（本机 x64 / Node 22.22 / V8 12.4）
 
 ```
@@ -76,6 +147,24 @@ node bench/bench.ts --file data/bench.db
 
 结论一句话：**逐条提交是 16 条/秒，批提交是 5 万条/秒。差 3160 倍，全部来自 fsync 合并。**
 
+### 业务数据引擎压测（30k 行）
+
+```
+node bench/biz.ts --rows 30000
+```
+
+| 场景 | 结果 |
+|---|---|
+| 写入 30000 行 | 1412ms → **21,254 行/秒**（页数 1058，重写 1072 次） |
+| 文件体积 / 有效负载 | 6.2MB / 3.7MB → 写放大约 **1.7×** |
+| `dept=R&D` 单条件 | 位图 p50 **9µs** / p99 77µs　全表扫 1.57ms |
+| `dept∈{R&D,QA}` 双值 | 位图 p50 **9µs** / p99 90µs　全表扫 1.59ms |
+| 三条件组合 | 位图 p50 **8µs** / p99 80µs　全表扫 2.11ms |
+| 冷启动 `open` | 189ms（行数 30000，重建 11 个位图） |
+
+位图相对全表扫快 **~180×**。冷启动这 189ms 是当前最大的短板：30k 行要逐页重放出索引。
+下一步是索引 snapshot——把位图和页目录整体存成一段，恢复时直接 mmap 式读回，预期降到 ~20ms。
+
 ## 已知取舍与坑
 
 - **body 不预留空间**：实测多次 `ftruncate` 增长会让 APFS 稀疏文件失效，预留 16MB×6 会把 23MB 数据占成 98MB。所以只有 shell 段预留（1MB），body 精确分配。
@@ -88,12 +177,14 @@ node bench/bench.ts --file data/bench.db
 
 - Node **≥ 22.18**（能直接跑 `.ts` 的类型擦除；更早版本需要先 `tsc` 编译，且没有 `zlib.crc32`）
 - 类型检查：`npm run typecheck`（TypeScript 7）
-- 测试：`npm test`（`node --test`）
+- 测试：`npm test` → 32 个用例（bitmap 16 / biz 9 / store 7）
+- 变异测试：`npm run mutate`、`npm run mutate:index`
 
 ## 设计来源
 
 完整设计文档：`docs/design.md`（《本地数据子系统 · 设计总纲》，含单文件形态、段表、清空三档、跨表索引、可读性预算）。
-本仓库是实现侧的最小可用内核（M1），尚未实现：位图索引、抓包列存、向量旁路。
+本仓库是实现侧的最小可用内核（M1）。已实现：段表 + group commit + CoW 页表 + 位图索引。
+尚未实现：索引 snapshot、抓包列存、向量旁路、`F_PUNCHHOLE` 打洞。
 
 ## License
 
