@@ -54,12 +54,12 @@ docs/scale-10g.md  撑到 10GB 的现状、瓶颈与四阶段改造（每阶段�
 
 ```bash
 npm run typecheck          # tsc 7.0.2，noEmit。必须零错误，CI 第一道门
-npm test                   # 156 个用例
+npm test                   # 157 个用例
 npm run mutate             # src/bitmap.ts       15/15  100%
 npm run mutate:index       # src/bizindex.ts     69/69  100%
 npm run mutate:page        # src/pagetable.ts    52/52  100%
 npm run mutate:snap        # src/snapshot.ts     25/25  100%
-npm run mutate:keys        # src/keydir.ts       48/48  100%
+npm run mutate:keys        # src/keydir.ts       49/49  100%
 npm run mutate:store       # src/store.ts        99/99  100%
 npm run mutate:all         # 六组全跑（日常只跑目标文件那组）
 

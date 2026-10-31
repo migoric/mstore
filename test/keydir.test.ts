@@ -41,6 +41,16 @@ test('内存目录允许首行 rowid=0，并保留 logical / rowid 双向映射'
   assert.equal(dir.getKey(0), undefined);
 });
 
+test('同一个 key 换 rowid 时，旧 rowid 的反查必须清掉', () => {
+  const dir = new MemoryKeyDirectory();
+  dir.set('a', { rowid: 1 });
+  assert.equal(dir.getKey(1), 'a');
+  dir.set('a', { rowid: 2 });
+  assert.equal(dir.getKey(1), undefined, '旧 rowid 1 不能再反查到 a');
+  assert.equal(dir.getKey(2), 'a');
+  assert.equal(dir.get('a')?.rowid, 2);
+});
+
 test('持久化多块索引支持全量点查、rowid 反查、Unicode 与增量增删', () => {
   const { io, meta } = persist(memoryRows(1000));
   const dir = new PersistentKeyDirectory(io, meta);
