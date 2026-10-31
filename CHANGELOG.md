@@ -6,6 +6,64 @@
 文件格式版本独立于包版本：`format_ver` 变动代表**旧文件需要迁移**，
 包版本变动不代表格式变动。两者都记在下面。
 
+## [Unreleased]
+
+### Added
+- **持久化统一 key 索引与二进制页目录**：`PageTable` / `BizIndex` 共享 `KeyDirectory`；磁盘按 key 与 rowid 双排序分块，打开只读稀疏索引、Bloom 和页目录，点查按块读取并校验 CRC。新写入只进入小型增量目录，flush 时物化有序块；普通快照命中该目录时跳过全部 `ROWS` 字符串解码。新增 `T.KEYS` 段与 `test/keydir.test.ts`，不改变 `format_ver`。
+- **分页查询下推**：`BizIndex.queryPage` / `Store.bizQueryPage` 只物化当前页，`matched` 仍精确统计全部命中行；纯枚举过滤直接用位图计数，CLI 与 stdio `biz.query` 不再先创建全量结果再 `slice`。
+- `body.range` 协议与 `Store.getBodyRange`：body 预览只读取指定范围，macOS 客户端固定只传前 4KB，不再把完整 body 编成 base64 后截取。
+- **业务页聚合写**：满页先进入脏页队列，提交时按物理偏移把相邻页合成最高 1MB 的写；页分配不再逐 4KB 调用 `ftruncate`。公开 `flushOpen()` 仍在返回前把全部脏页落盘。
+- **异步提交管线**：同时只有一个 `fsync` 在途，等待期间 Node 事件循环和读请求可继续运行；ack 仍严格等待对应刷盘完成。
+- **枚举字典 ID**：每行记录旧枚举值，更新和删除只清目标位图，不再遍历该字段的全部取值。
+- **快照 v3**：页目录物理偏移升级为 u64，枚举行字典直接进入快照，TypedArray 使用整块拷贝；旧快照自动回退逐页重放。打开 meta 时先读长度，再读实际内容，不再固定读取两份 1MB。
+- **页缓存（`StoreOpts.pageCachePages`，默认 1024 页）**：点查的成本 64% 在
+  「把整页 48 行 JSON.parse 出来」（19.6µs），pread 只占 3.7µs，所以缓存的是
+  解码后的页而不是原始字节。LRU 用 `Map` 插入序实现；返回值一律深拷贝（约 1.1µs），
+  语义与无缓存时完全一致。写路径在 `writePage`（唯一写页内容的地方）同步更新缓存，
+  put/delete 的读-改-写不需要各自管缓存。实测 2 万行随机点查 33.2µs → 1.9µs
+  （命中率 99%）。容量必须盖住工作集，否则 LRU 抖动等于没加。
+- `bench/vs-sqlite.ts`：与 SQLite 的四方对等对比基准（mstore / sqlite-full /
+  sqlite-wal / sqlite-quick），四引擎分进程跑避免内存互相污染，见 README 性能节。
+
+### Changed
+- **组提交不再让队首请求空等**：`submit` 改为 0ms 定时器立即 drain。
+  窗口的作用是让后来者搭车，不是让第一个请求罚站——串行 `for await put` 时
+  队列永远只有 1 个 op，原实现每条白等一整个 window（实测 40ms 窗口 + 20ms fsync
+  = 16 行/秒）。同一 tick 内的后续 op 仍并进同一批，真正的合批能力来自 fsync 在途。
+  串行逐条 16 → 42 行/秒，并发组提交 2,824 → 7,332 行/秒。
+- `stats.fsyncs` 修复为真实计数（原来从未自增，`report()` 里恒为 0）。
+
+### Fixed
+- stdio `quit` 改为先完成 `close()`、meta 与索引快照落盘，再返回响应；客户端收到响应后立即终止 sidecar 也不会跳过退出收尾。
+- **open 页行迁移不再丢失 rowid**：更新变大导致行迁出时，原实现把统一目录项整条删除（连带 rowid）再重插，BizIndex 会分配新 rowid 而旧位图不清，产生重复 rowid 与幽灵存活行；现在只覆盖 logical，rowid 原样保留。
+- **replay 后 `nextRowid` 从 0 撞号**：持久化 key 目录有效但普通快照禁用/损坏/缺失时，重放使用旧 rowid 重建索引却不推进 `nextRowid`，新行从 0 开始覆盖已有位。现在 `BizIndex.put` 对任意已见 rowid 推进 `nextRowid`。
+- **`_reclaimTail` 不再回退到未落盘 live 页之前**：页分配改为内存高水位后，尾段回收只看 `io.size()` 会把已分配未写盘的 CoW 页判为不存在，回退 hwm 后新分配覆盖旧页。现在用 `max(io.size(), hwm)` 判断逻辑尾部。
+- **页缓存与脏页不再共享调用方对象**：`put` 在入口深拷贝 value，`entries()` 逐行返回副本；原实现调用方修改原对象或遍历结果会绕过写路径，直接改变缓存中的已提交值。
+- **close 拒绝关闭期间的新写入**：`closing` 在第一次 await 之前置位，写 API 统一走 `_submit` 检查；`close` 幂等并等待已接受操作全部 drain。
+- **快照编码不再把缺 rowid 的 key 伪造为 rowid 0**：此类 key 正确写入 `LOOSE` 块；缺 logical 的条目直接报错，不静默写 0。
+- **key 块字节账修正**：首条记录与 8B 块头计入预算，实际块长不再超过声明的 4096B；单条超预算仍允许独占一块。
+- **二进制页目录增加 `dirCrc`**：页目录损坏时整份 key 索引回退页扫描，不再携带错误物理偏移。key 块损坏仍在读取时显式报错（懒加载换完整性可见性，未做自动回退）。
+- 保留 `PageTable.snapshotIndex()` 兼容包装（内部改用共享目录实现），删除它的破坏性改动已撤销。
+
+### Performance
+- 本轮同机前后对照：10 万行批量写入 **759 → 46,260 行/秒（约 61×）**，主要来自脏页合并写与去除逐页 `ftruncate`；3 万行 `bench/open.ts --rounds 3` 快照中位 **29.21ms**、重放 **185.85ms（6.4×）**，5 组筛选器结果一致。
+- 20 万行、单部门命中 4 万行的微基准：旧的全量物化 p50 **1.974ms**；分页接口在保留精确 `matched` 的同时 p50 **0.126ms**，只返回 50 行。
+
+20 万行 `bench/vs-sqlite.ts` 实测（各引擎独占进程，持久级别显式对齐）：
+
+| 逐条持久写 | 行/秒 | 物理持久 |
+|---|---:|---|
+| sqlite-full（DELETE+FULL+fullfsync=ON） | 16 | ✓ |
+| mstore 串行 | **45** | ✓ |
+| sqlite-wal（WAL+FULL+fullfsync=ON） | 50 | ✓ |
+| sqlite-quick（WAL+NORMAL，不保证持久） | 8,954 | ✗ |
+| mstore 批量导入（组提交） | **46,576** | ✓ |
+
+过滤查询：枚举+数值组合快 16–17×，区间命中 20% 快 9–12×；
+点查在默认页缓存下慢 2–3.9×（工作集盖不住时 LRU 抖动），
+区间命中 0 慢 21–72×（块级 min/max 剪不掉落在块内部的空隙，结构性代价）。
+代价：RSS 约为 SQLite 的 2 倍，冷启动 313ms vs 2ms。完整表与解读见 README。
+
 ## [0.3.0] — 2026-10-31
 
 ### Added
@@ -97,10 +155,9 @@
 - 手动触发（`workflow_dispatch`）只产 artifact、不发 release，用来验证打包链路。
 
 ### 计划中
-- **阶段 2：key 索引落盘**（10GB 的关键一步）。现在内存里有**四份**按 key 索引的结构
-  （`pagetable.index`、`bizindex.rowids`、`bizindex.keys`、shell 的 `store.idx` + `order`），
-  6600 万行约 6.0GB。改为有序 key 块 + 稀疏索引 + 块级 Bloom + 页缓存，内存降到约 77MB。
-  **会改磁盘格式，需要 `format_ver` 升级与迁移**。
+- **阶段 2：key 索引落盘（本轮已实现）**。`PageTable` 与 `BizIndex` 已共享目录，
+  业务 key 改为按 key / rowid 双排序块 + 稀疏索引 + Bloom + 块缓存，页目录同步改为 u64 二进制。
+  新增 `T.KEYS` 段，保持 `format_ver=1`；百万 / 千万行内存与冷启动仍需专项验收。
 - 阶段 3：数值列与位图按块落盘（64K 行大块 + 4096 行子块的两级统计）。
 - 阶段 4：compaction（压掉 1.6× 写放大）+ 按 key 分区多写者（导入 1000 万行 ≤4 分钟）。
 - KV 索引快照：`capture` / `mock` / `agent` 三个 ns 目前每次打开都重放 shell 段。

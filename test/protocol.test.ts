@@ -79,6 +79,7 @@ async function connect(file: string): Promise<Client> {
     },
     async stop() {
       child.stdin.end();
+      if (child.exitCode !== null || child.signalCode !== null) return;
       await new Promise<void>((r) => child.once('exit', () => r()));
     },
   };
@@ -123,6 +124,13 @@ test('KV：put / get / list / body / info / check / clear 往返', async () => {
   const bodyRes = readBack.result as { base64: string; len: number };
   assert.equal(bodyRes.len, 1024);
   assert.deepEqual(Buffer.from(bodyRes.base64, 'base64'), body, 'body 必须原样往返，不能多一个字节');
+
+  const ranged = await c.send({ op: 'body.range', ns: 'agent', key: 'run_1', off: 10, len: 17 });
+  const rangeRes = ranged.result as { base64: string; len: number; off: number; total: number };
+  assert.equal(rangeRes.len, 17);
+  assert.equal(rangeRes.off, 10);
+  assert.equal(rangeRes.total, 1024);
+  assert.deepEqual(Buffer.from(rangeRes.base64, 'base64'), body.subarray(10, 27));
 
   const info = await c.send({ op: 'info' });
   assert.equal(((info.result as { records: Record<string, number> }).records).capture, 1);
@@ -181,6 +189,21 @@ test('业务表：info / put / query / get / del / clear', async () => {
   assert.equal((cleared.result as { rows: number }).rows, 2);
   assert.equal(((await c.send({ op: 'biz.query', filter: {} })).result as { matched: number }).matched, 0);
   await c.stop();
+});
+
+test('quit 响应返回前 close 与索引快照已经完成', async () => {
+  const f = mkdb('quit');
+  const c = await connect(f);
+  const put = await c.send({ op: 'biz.put', key: 'u_1', value: { dept: 'R&D', level: 7 } });
+  assert.equal(put.ok, true);
+  const quit = await c.send({ op: 'quit' });
+  assert.equal(quit.ok, true);
+  await c.stop();
+
+  const db = Store.open(f);
+  assert.equal(db.openPath, 'snapshot', '客户端收到 quit 响应时，磁盘必须已经可立即用快照打开');
+  assert.deepEqual(db.bizGet('u_1'), { dept: 'R&D', level: 7 });
+  await db.close();
 });
 
 test('协议健壮性：坏 JSON 与未知方法都不该把 sidecar 带死', async () => {

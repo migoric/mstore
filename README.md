@@ -24,10 +24,12 @@
 
 **业务表**
 
-- **CoW 页表 + 追加缓冲**：改一行重写整页，但新行先攒在内存，满页（按字节）才落一次盘
+- **CoW 页表 + 聚合写**：改一行重写整页；脏页先在内存聚合，提交时把相邻页合成最高 1MB 的写，不再逐页扩展文件
+- **异步刷盘等待**：单 `fsync` 在途，等待期间查询和事件循环继续运行，ack 仍等物理刷盘完成
 - **位图索引**：枚举字段 `Uint32Array` 位图，数值字段 `Float64Array` 列
 - **数值区间块级剪枝**：数值列按 4096 行一块记 min/max，`{gte, lte}` 整块不可能命中就跳过
-- **索引快照**：冷启动跳过逐页重放，一次 `pread` + 一次 `memcpy`；快照失效自动回退
+- **持久化 key 索引**：PageTable 与 BizIndex 共享目录；按 key / rowid 有序块 + 稀疏索引 + Bloom + 块缓存，页目录用 u64 二进制保存
+- **索引快照**：冷启动跳过逐页重放；命中持久化 key 索引时不再解码全部 key 字符串，快照失效自动回退
 
 **外围**
 
@@ -44,7 +46,7 @@
 
 | 场景 | 结果 |
 |---|---|
-| 逐条 `await` 写入（每条约一次 fsync） | 300 条 **18.2s** → 16 条/秒 |
+| 逐条 `await` 写入（每条一次 fsync，20.02ms 档） | 300 条 **6.4s** → **47 条/秒** |
 | 同批并发写入（group commit） | 5000 条 **91ms** → **54,877 条/秒** |
 | 点查（内存索引，批量折算） | p50 **82 ns** / p99 156 ns |
 | 列表 50 条 | p50 **7 µs** / p99 112 µs |
@@ -88,6 +90,43 @@
 50k→100k 快照解码撞上 V8 老生代 GC，加速比回落到 3.3×。这是当前天花板，
 要到百万行得把 key 块改成「偏移表 + 共享字符串池」。10GB 的完整瓶颈分析见
 [`docs/scale-10g.md`](docs/scale-10g.md)。
+
+**vs SQLite**（20 万行 6 字段，`bench/vs-sqlite.ts` 实测，四方各占一个进程）
+
+持久级别对齐是这张表的前提：macOS 上 `fsync(2)` 只到页缓存，只有 `F_FULLFSYNC`
+保证掉电不丢——Node 的 `fs.fsyncSync` 走的就是后者，SQLite 默认 `fullfsync=0`
+却不是。所以 sqlite-full / sqlite-wal 都显式开了 `fullfsync=ON`（实测同一 FULL
+配置差 966 vs 17 行/秒，56 倍全是持久级别差）；sqlite-quick 是生产最常见的
+WAL+NORMAL，它快是因为答应的事情更少。
+
+| 指标 | mstore | sqlite-full | sqlite-wal | sqlite-quick |
+|---|---:|---:|---:|---:|
+| 物理持久（掉电不丢已提交） | ✓ | ✓ | ✓ | **✗** |
+| 逐条持久写（行/秒） | **45** | 16 | **50** | 8,954 |
+| 批量导入（行/秒） | **46,576** | 8,051 | 18,155 | 50,676 |
+| 点查（p50） | 34.9µs | 17.0µs | **9.3µs** | 9.0µs |
+| 枚举+数值过滤（命中 20%） | **1.79ms** | 30.1ms | 28.4ms | 26.1ms |
+| 区间命中 0（p50） | 220µs | 10.5µs | **3.0µs** | 3.2µs |
+| 区间命中 20% | **2.97ms** | 37.0ms | 26.2ms | 29.6ms |
+| 磁盘占用 | 36.8MB | 25.0MB | 25.0MB | 25.0MB |
+| RSS | 307MB | 159MB | 142MB | 160MB |
+| 冷启动 | 313ms | 1.8ms | 2.3ms | 2.4ms |
+
+怎么读这张表：
+
+- **同一持久级别下，写不是 mstore 的短板**：逐条与 sqlite-wal 打平（45 vs 50 行/秒），
+  比 sqlite-full 快 2.8×；批量导入快 5.8×。sqlite-quick 的 8,954 行/秒以不保证
+  持久为代价，与 mstore 不可比。
+- **过滤查询是位图的主场**：枚举+数值组合快 16–17×，区间命中 20% 快 9–12×。
+- **点查反而慢 2–3.9×**：20 万行约 4,167 页，默认 1024 页的页缓存盖不住工作集，
+  LRU 抖动下退回「pread + JSON.parse」路径（35µs）。缓存盖住工作集时是 1.9µs
+  （见 `StoreOpts.pageCachePages`）——用内存换点查，这笔账连着 RSS 一起算。
+- **区间命中 0 慢 21–72×**：本基准 `ms = i*2`，`ms∈[1,1]` 落在某个 4096 行块
+  的内部，块统计（min/max）剪不掉，必须解码整块确认。SQLite 的行级 B-tree
+  能直接 seek 到空隙。这是块级剪枝的结构性代价，不是 bug——区间跨整块时
+  剪枝才是主场（见上一张表：百万行命中 0.01% 快 105×）。
+- **代价写在内存和冷启动里**：索引常驻内存，RSS 约为 SQLite 的 2 倍，
+  冷启动要重建内存索引（313ms vs 2ms）。
 
 ## 用法
 
@@ -146,7 +185,8 @@ await db.close();
 | `info` / `check` | — | 库统计 / 自检报告 |
 | `list` | `ns`, `limit`, `after` | 记录数组 |
 | `get` | `ns`, `key` | `{value, body, seg, ts}` |
-| `body` | `ns`, `key` | `{base64, len}`（演示用；大 body 别走这条） |
+| `body` | `ns`, `key` | `{base64, len}`（兼容用；大 body 别走这条） |
+| `body.range` | `ns`, `key`, `off`, `len` | `{base64, len, off, total}`；只读并返回指定范围 |
 | `put` | `ns`, `key`, `value` | `{seq}` |
 | `putbody` | `ns`, `key`, `base64`, `meta` | `{seq, loc}` |
 | `clear` | `ns` | `{freedBytes, deadSegs, truncated}` |
@@ -164,8 +204,7 @@ await db.close();
 - **清空后空间不一定立刻归还**：尾部死段 `ftruncate`，中间死段登记为可复用空洞；
   立刻归还需要的 `F_PUNCHHOLE` 在 Node 里没有（需 C helper，见 `MSTORE_PUNCH_HELPER`）
 - **meta 上限 1MB**：约 1.2 万段，超了要调大 `META_SIZE` 或压缩段表
-- **10GB 目前不可用**：内存里有四份全量 key 索引，6600 万行约 6.0GB、冷启动约 90 秒。
-  改造路线与验收判据见 [`docs/scale-10g.md`](docs/scale-10g.md)
+- **10GB 仍未通过验收**：key 索引与页目录已分块落盘，但数值列仍是全量 `Float64Array`，meta 也保留兼容用 JSON 页目录；冷启动与内存目标需按 [`docs/scale-10g.md`](docs/scale-10g.md) 重新验收
 - **KV 命名空间每次打开都重放**：索引快照目前只覆盖 `biz`
 
 ## 需要什么
@@ -179,8 +218,8 @@ await db.close();
 
 ```bash
 npm run typecheck    # TypeScript 7
-npm test             # 122 个用例，约 58s
-npm run mutate:all   # 变异测试五组，100%（store 那组 84/85）
+npm test             # 145 个用例
+npm run mutate:all   # 变异测试六组（store 那组 85/86，其余目标 100%）
 npm run bench:predicate -- --rows 1000000   # 区间查询 A/B
 npm run bench:scale  -- --rows 1000000      # 索引内存与冷启动
 ```

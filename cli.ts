@@ -239,16 +239,14 @@ async function main(): Promise<void> {
       const filter = JSON.parse(raw) as Filter;
       const limit = Number(argAfter(argv, '--limit', '50'));
       const t0 = performance.now();
-      const { keys, rowids } = db.bizQuery(filter);
+      const result = db.bizQueryPage({ ...filter, limit });
       const took = performance.now() - t0;
-      const page = keys.slice(0, limit);
       if (argv.includes('--json')) {
-        console.log(JSON.stringify({ took_us: +(took * 1000).toFixed(1), matched: keys.length, rows: page.map((k) => ({ key: k, value: db.bizGet(k) })) }, null, 2));
+        console.log(JSON.stringify({ took_us: +(took * 1000).toFixed(1), matched: result.matched, rows: result.keys.map((k, i) => ({ key: k, rowid: result.rowids[i], value: db.bizGet(k) })) }, null, 2));
       } else {
-        console.error(`# 命中 ${keys.length} 条，用时 ${(took * 1000).toFixed(1)}µs，显示前 ${page.length} 条`);
-        for (const k of page) console.log(`${k}\t${JSON.stringify(db.bizGet(k))}`);
+        console.error(`# 命中 ${result.matched} 条，用时 ${(took * 1000).toFixed(1)}µs，显示前 ${result.keys.length} 条`);
+        for (const k of result.keys) console.log(`${k}\t${JSON.stringify(db.bizGet(k))}`);
       }
-      void rowids;
       await db.close();
       return;
     }
@@ -296,6 +294,8 @@ async function serve(db: Store): Promise<void> {
       key?: string;
       value?: unknown;
       limit?: number;
+      off?: number;
+      len?: number;
       after?: string;
       filter?: Filter;
       /** putbody 用：body 走 base64，元信息另放 */
@@ -327,6 +327,15 @@ async function serve(db: Store): Promise<void> {
           send({ id, ok: true, result: buf ? { base64: buf.toString('base64'), len: buf.length } : null });
           break;
         }
+        case 'body.range': {
+          const r = db.getBodyRange(req.ns as NsName, req.key!, req.off ?? 0, req.len ?? 4096);
+          send({
+            id,
+            ok: true,
+            result: r ? { base64: r.bytes.toString('base64'), len: r.bytes.length, off: r.off, total: r.total } : null,
+          });
+          break;
+        }
         case 'put': {
           const r = await db.put(req.ns as NsName, req.key!, req.value);
           send({ id, ok: true, result: r });
@@ -346,17 +355,16 @@ async function serve(db: Store): Promise<void> {
           break;
         case 'biz.query': {
           const t0 = performance.now();
-          const { keys, rowids } = db.bizQuery(req.filter ?? {});
-          const took = performance.now() - t0;
           const limit = req.limit ?? 200;
-          const page = keys.slice(0, limit);
+          const result = db.bizQueryPage({ ...(req.filter ?? {}), limit });
+          const took = performance.now() - t0;
           send({
             id,
             ok: true,
             result: {
               took_us: +(took * 1000).toFixed(1),
-              matched: keys.length,
-              rows: page.map((k, i) => ({ key: k, rowid: rowids[i], value: db.bizGet(k) })),
+              matched: result.matched,
+              rows: result.keys.map((k, i) => ({ key: k, rowid: result.rowids[i], value: db.bizGet(k) })),
             },
           });
           break;
@@ -391,8 +399,8 @@ async function serve(db: Store): Promise<void> {
           break;
         }
         case 'quit':
-          send({ id, ok: true });
           await db.close();
+          send({ id, ok: true });
           return;
         default:
           send({ id, ok: false, error: `unknown op: ${req.op}` });

@@ -25,9 +25,9 @@ export const SEG_MAGIC: Buffer = Buffer.from('SEG0', 'latin1');
 export const DEFAULT_SEG_SIZE = 16 * 1024 * 1024;
 
 /** 段类型 */
-export const T = { FREE: 0, SHELL: 1, BODY: 2, SNAP: 3 } as const;
+export const T = { FREE: 0, SHELL: 1, BODY: 2, SNAP: 3, KEYS: 4 } as const;
 export type SegType = (typeof T)[keyof typeof T];
-export const TYPE_NAME: Record<number, string> = { 0: 'free', 1: 'shell', 2: 'body', 3: 'snapshot' };
+export const TYPE_NAME: Record<number, string> = { 0: 'free', 1: 'shell', 2: 'body', 3: 'snapshot', 4: 'keys' };
 
 /**
  * 命名空间写进段头，用于「整段丢弃」式清空。

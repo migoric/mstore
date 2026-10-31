@@ -36,11 +36,10 @@ import type { PageTable } from './pagetable.ts';
 
 export const SNAP_MAGIC = Buffer.from('MSNP', 'latin1');
 /**
- * 2 = 数值块追加了块级 min/max 统计（区间查询剪枝用）。
- * 升版本而不是做兼容读：版本不符就整份拒绝、回退重放，旧库只是慢一次，
- * 绝不会拿错位的数据去恢复索引。
+ * 3 = 页目录偏移升级为 u64，枚举列携带行字典；TypedArray 全部按块拷贝。
+ * 版本不符就整份拒绝、回退重放，旧库只是慢一次，绝不会拿错位数据恢复索引。
  */
-export const SNAP_VER = 2;
+export const SNAP_VER = 3;
 
 const TAG = {
   DIR: 1,
@@ -91,20 +90,25 @@ class Writer {
     this.pos += 4;
   }
 
+  u64(v: number): void {
+    if (!Number.isSafeInteger(v) || v < 0) throw new Error(`snapshot u64 offset out of range: ${v}`);
+    this.need(8);
+    this.buf.writeBigUInt64LE(BigInt(v), this.pos);
+    this.pos += 8;
+  }
+
   f64Array(a: Float64Array): void {
-    this.need(a.length * 8);
-    for (let i = 0; i < a.length; i++) {
-      this.buf.writeDoubleLE(a[i]!, this.pos);
-      this.pos += 8;
-    }
+    const bytes = a.length * 8;
+    this.need(bytes);
+    Buffer.from(a.buffer, a.byteOffset, bytes).copy(this.buf, this.pos);
+    this.pos += bytes;
   }
 
   u32Array(a: Uint32Array): void {
-    this.need(a.length * 4);
-    for (let i = 0; i < a.length; i++) {
-      this.buf.writeUInt32LE(a[i]! >>> 0, this.pos);
-      this.pos += 4;
-    }
+    const bytes = a.length * 4;
+    this.need(bytes);
+    Buffer.from(a.buffer, a.byteOffset, bytes).copy(this.buf, this.pos);
+    this.pos += bytes;
   }
 
   str(s: string): void {
@@ -188,23 +192,29 @@ class Reader {
     return v;
   }
 
+  u64(): number {
+    this.demand(8);
+    const v = this.buf.readBigUInt64LE(this.pos);
+    this.pos += 8;
+    if (v > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error(`snapshot u64 offset out of range: ${v}`);
+    return Number(v);
+  }
+
   u32Array(n: number): Uint32Array {
-    this.demand(n * 4);
+    const bytes = n * 4;
+    this.demand(bytes);
     const out = new Uint32Array(n);
-    for (let i = 0; i < n; i++) {
-      out[i] = this.buf.readUInt32LE(this.pos);
-      this.pos += 4;
-    }
+    this.buf.copy(Buffer.from(out.buffer), 0, this.pos, this.pos + bytes);
+    this.pos += bytes;
     return out;
   }
 
   f64Array(n: number): Float64Array {
-    this.demand(n * 8);
+    const bytes = n * 8;
+    this.demand(bytes);
     const out = new Float64Array(n);
-    for (let i = 0; i < n; i++) {
-      out[i] = this.buf.readDoubleLE(this.pos);
-      this.pos += 8;
-    }
+    this.buf.copy(Buffer.from(out.buffer), 0, this.pos, this.pos + bytes);
+    this.pos += bytes;
     return out;
   }
 
@@ -230,14 +240,14 @@ export interface SnapInfo {
 /** 把页表映射 + 位图索引整体编码成一段二进制 */
 export function encodeSnapshot(pages: PageTable, biz: BizIndex): Buffer {
   const dir = pages.snapshotDir();
-  const index = pages.snapshotIndex();
+  const entries = pages.snapshotEntries();
   const state = biz.snapshotState();
   // 粗估每条 32B（rowid + logical + 平均 12B 的 key + 长度头），key 只存一次
-  const w = new Writer(index.size * 32 + 64 * 1024);
+  const w = new Writer(pages.snapshotSize() * 32 + 64 * 1024);
 
   let at = w.beginBlock(TAG.DIR);
   w.u32(dir.length);
-  for (const off of dir) w.u32(off);
+  for (const off of dir) w.u64(off);
   w.endBlock(at);
 
   // ROWS + LOOSE：一趟遍历页表索引。走页表而不是走位图索引，是因为页表的 key 集合才是全集。
@@ -246,14 +256,16 @@ export function encodeSnapshot(pages: PageTable, biz: BizIndex): Buffer {
   w.u32(0);
   const loose: Array<readonly [string, number]> = [];
   let rows = 0;
-  for (const [key, logical] of index) {
-    const rowid = biz.rowidOf(key);
-    if (rowid === undefined) {
-      loose.push([key, logical]);
+  for (const [key, rec] of entries) {
+    if (rec.logical === undefined) throw new Error(`snapshot entry missing logical page: ${key}`);
+    if (rec.rowid === undefined) {
+      // 页表可以独立于 BizIndex 使用；这类 key 没有 rowid，不能靠 `!`
+      // 把 undefined 静默编码成 0，否则恢复后会与真正的首行撞号。
+      loose.push([key, rec.logical]);
       continue;
     }
-    w.u32(rowid);
-    w.u32(logical);
+    w.u32(rec.rowid);
+    w.u32(rec.logical);
     w.str(key);
     rows++;
   }
@@ -280,6 +292,8 @@ export function encodeSnapshot(pages: PageTable, biz: BizIndex): Buffer {
       w.u32(v.bitmap.words.length);
       w.u32Array(v.bitmap.words);
     }
+    w.u32(col.rows.length);
+    w.u32Array(col.rows);
   }
   w.endBlock(at);
 
@@ -321,7 +335,7 @@ export function encodeSnapshot(pages: PageTable, biz: BizIndex): Buffer {
  * 落地阶段如果还是抛了（块内长度字段被改坏），调用方必须回退到逐页重放——
  * 所以恢复**不能**留下「一半新一半旧」的可用状态当结果用。
  */
-export function decodeSnapshot(buf: Buffer, pages: PageTable, biz: BizIndex): SnapInfo {
+export function decodeSnapshot(buf: Buffer, pages: PageTable, biz: BizIndex, restoreKeys = true): SnapInfo {
   if (buf.length < FILE_HEAD) throw new Error(`snapshot too short: ${buf.length}B`); // equiv: 长度正好 12 时走「missing DIR」那条拒绝路径，两条路都是拒绝
   if (!buf.subarray(0, 4).equals(SNAP_MAGIC)) throw new Error('bad snapshot magic');
   const ver = buf.readUInt16LE(4);
@@ -347,7 +361,7 @@ export function decodeSnapshot(buf: Buffer, pages: PageTable, biz: BizIndex): Sn
   let rowKeys: string[] = [];
   let rowLogicals: number[] = [];
   const loose: Array<[string, number]> = [];
-  let enumCols: Array<{ field: string; values: Array<{ value: string; bitmap: Bitmap }> }> = [];
+  let enumCols: Array<{ field: string; rows: Uint32Array; values: Array<{ value: string; bitmap: Bitmap }> }> = [];
   let numCols: Array<{ field: string; data: Float64Array; bmin: Float64Array; bmax: Float64Array }> = [];
   let alive: Bitmap | null = null;
   let state: { nextRowid: number; liveCount: number; capacity: number } | null = null;
@@ -357,12 +371,13 @@ export function decodeSnapshot(buf: Buffer, pages: PageTable, biz: BizIndex): Sn
     switch (b.tag) {
       case TAG.DIR: {
         const n = r.u32();
-        if (n * 4 + 4 > b.len) throw new Error(`snapshot: DIR declares ${n} offsets but block is ${b.len}B`);
+        if (n * 8 + 4 > b.len) throw new Error(`snapshot: DIR declares ${n} offsets but block is ${b.len}B`);
         dir = [];
-        for (let k = 0; k < n; k++) dir.push(r.u32());
+        for (let k = 0; k < n; k++) dir.push(r.u64());
         break;
       }
       case TAG.ROWS: {
+        if (!restoreKeys) break;
         const n = r.u32();
         rowKeys = new Array(n);
         rowLogicals = new Array(n);
@@ -377,6 +392,7 @@ export function decodeSnapshot(buf: Buffer, pages: PageTable, biz: BizIndex): Sn
         break;
       }
       case TAG.LOOSE: {
+        if (!restoreKeys) break;
         const n = r.u32();
         for (let k = 0; k < n; k++) {
           const logical = r.u32();
@@ -397,7 +413,8 @@ export function decodeSnapshot(buf: Buffer, pages: PageTable, biz: BizIndex): Sn
             const wordCount = r.u32();
             values.push({ value, bitmap: Bitmap.from(r.u32Array(wordCount), capacity) });
           }
-          enumCols.push({ field, values });
+          const rows = r.u32Array(r.u32());
+          enumCols.push({ field, rows, values });
         }
         break;
       }
@@ -432,13 +449,17 @@ export function decodeSnapshot(buf: Buffer, pages: PageTable, biz: BizIndex): Sn
   if (!alive) throw new Error('snapshot: missing ALIVE');
   if (!state) throw new Error('snapshot: missing STATE');
 
-  pages.restoreSnapshot(dir, rowKeys, rowLogicals, loose);
-  biz.restoreSnapshot({ keys: rowKeys, enums: enumCols, nums: numCols, alive, state });
+  pages.restoreSnapshot(dir, rowKeys, rowLogicals, loose, restoreKeys);
+  biz.restoreSnapshot({ keys: rowKeys, enums: enumCols, nums: numCols, alive, state }, restoreKeys, false);
 
   let bitmaps = 0;
   for (const col of enumCols) bitmaps += col.values.length;
   let live = 0;
-  for (let i = 0; i < rowKeys.length; i++) if (rowKeys[i] !== undefined) live++;
+  if (restoreKeys) {
+    for (let i = 0; i < rowKeys.length; i++) if (rowKeys[i] !== undefined) live++;
+  } else {
+    live = pages.snapshotSize();
+  }
   return {
     ver,
     blocks: blockCount,

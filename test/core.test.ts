@@ -92,7 +92,15 @@ test('body：原样进出，locator 落在段范围内，check 通过', async ()
 
   assert.deepEqual(db.getBody('agent', 'run_1'), body);
   assert.deepEqual(db.bodyAt(loc!), body, '拿 locator 直接读也要一致');
+  const range = db.getBodyRange('agent', 'run_1', 7, 23);
+  assert.deepEqual(range?.bytes, body.subarray(7, 30));
+  assert.equal(range?.off, 7);
+  assert.equal(range?.total, body.length);
+  const tail = db.getBodyRange('agent', 'run_1', body.length - 5, 50);
+  assert.deepEqual(tail?.bytes, body.subarray(body.length - 5), '长度必须截到 EOF，不能越界读');
+  assert.deepEqual(db.getBodyRange('agent', 'run_1', body.length + 1, 50)?.bytes, Buffer.alloc(0));
   assert.equal(db.getBody('agent', '没有 body 的键'), null);
+  assert.equal(db.getBodyRange('agent', '没有 body 的键', 0, 10), null);
   assert.equal(db.check().ok, true, JSON.stringify(db.check().issues));
   await db.close();
 

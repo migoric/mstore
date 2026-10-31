@@ -22,6 +22,8 @@ import { PageTable } from './pagetable.ts';
 import { BizIndex } from './bizindex.ts';
 import { encodeSnapshot, decodeSnapshot } from './snapshot.ts';
 import type { SnapInfo } from './snapshot.ts';
+import { MemoryKeyDirectory, PersistentKeyDirectory, encodeKeyDirectory, readKeyPageDir, shiftKeyIndexOffsets } from './keydir.ts';
+import type { KeyDirectory } from './keydir.ts';
 import type { Filter } from './bizindex.ts';
 import type {
   Meta,
@@ -37,6 +39,13 @@ import type {
 
 const MB = 1024 * 1024;
 
+function readMetaAt(io: Io, off: number): Meta | null {
+  const head = io.readAt(off, 8);
+  const len = head.readUInt32LE(0);
+  if (len === 0 || len + 8 > F.META_SIZE) return null;
+  return F.decodeMeta(Buffer.concat([head, io.readAt(off + 8, len)]));
+}
+
 export interface StoreOpts {
   /** shell 段预留大小，默认 1MB。不要随意调大：预留会真占磁盘 */
   shellCap?: number;
@@ -48,6 +57,15 @@ export interface StoreOpts {
   bizNumFields?: string[];
   /** 页大小（CoW 页表），默认 4096 */
   pageSize?: number;
+  /**
+   * 解码后页的缓存页数，默认 1024（约 14MB，覆盖 4.9 万行）。传 0 关掉。
+   *
+   * 点查的成本几乎全在「把整页 48 行 JSON.parse 出来」（19.6µs），pread 只占 3.7µs，
+   * 所以缓存的是解码后的页。容量必须能盖住工作集，否则 LRU 抖动等于没加：
+   * 实测 2 万行（417 页）的库，256 页缓存命不中、随机点查 35µs；
+   * 4096 页时命中率 99%、点查 1.9µs。
+   */
+  pageCachePages?: number;
   /**
    * 是否启用索引快照，默认 true。
    * 关掉之后每次 open 都逐页重放——调试「快照和重放结果不一致」时用。
@@ -80,6 +98,8 @@ export class Store {
   meta: Meta;
   readonly shellCap: number;
   closed = false;
+  private closing = false;
+  private closePromise: Promise<void> | null = null;
 
   private idx = new Map<number, Map<string, Entry>>();
   private order = new Map<number, string[]>();
@@ -92,6 +112,7 @@ export class Store {
   private lastMetaAt = 0;
   readonly pages: PageTable;
   readonly biz: BizIndex;
+  readonly directory: KeyDirectory;
 
   /** 快照开关（关掉只影响性能，不影响结果） */
   readonly snapshotEnabled: boolean;
@@ -113,10 +134,23 @@ export class Store {
     this.pool = new BufferPool(io);
     this.committer = new Committer({
       flush: () => this._flushNow(),
-      fsync: () => this.io.fsync(),
+      fsync: () => this.io.fsyncAsync(),
     });
     for (const s of meta.segs) this.segById.set(s.id, s);
     this.freeSpans = meta.freeSpans ?? [];
+    const keys = meta.keys;
+    const keySeg = keys ? this.segById.get(keys.seg) : undefined;
+    if (keys && keys.epoch === (meta.bizEpoch ?? 0) && keySeg?.live && keySeg.type === F.T.KEYS) {
+      try {
+        this.directory = new PersistentKeyDirectory(io, keys);
+        meta.pageDir = readKeyPageDir(io, keys);
+      } catch {
+        this.directory = new MemoryKeyDirectory();
+        meta.keys = undefined;
+      }
+    } else {
+      this.directory = new MemoryKeyDirectory();
+    }
     this.pages = new PageTable(
       io,
       meta,
@@ -124,9 +158,9 @@ export class Store {
       () => {
         this.metaDirty = true; // equiv: 每次 writePage 都走 _allocRun，那条路已经标过脏
       },
-      { pageSize: opts.pageSize }
+      { pageSize: opts.pageSize, pageCachePages: opts.pageCachePages, directory: this.directory }
     );
-    this.biz = new BizIndex(opts.bizEnumFields ?? DEFAULT_ENUM_FIELDS, opts.bizNumFields ?? DEFAULT_NUM_FIELDS);
+    this.biz = new BizIndex(opts.bizEnumFields ?? DEFAULT_ENUM_FIELDS, opts.bizNumFields ?? DEFAULT_NUM_FIELDS, this.directory);
   }
 
   // ---------------- 创建 / 打开 ----------------
@@ -148,8 +182,8 @@ export class Store {
     const t0 = performance.now();
     const io = Io.open(file);
     const head = F.decodeHeader(io.readAt(0, F.HEADER_SIZE));
-    const a = F.decodeMeta(io.readAt(F.META_A_OFF, F.META_SIZE));
-    const b = F.decodeMeta(io.readAt(F.META_B_OFF, F.META_SIZE));
+    const a = readMetaAt(io, F.META_A_OFF);
+    const b = readMetaAt(io, F.META_B_OFF);
     const candidates: Array<{ meta: Meta; slot: 'a' | 'b' }> = [];
     if (a) candidates.push({ meta: a, slot: 'a' });
     if (b) candidates.push({ meta: b, slot: 'b' });
@@ -211,14 +245,15 @@ export class Store {
       this.openNote = 'snapshot CRC mismatch';
       return false;
     }
+    const restoreKeys = !this.directory.persistent;
     try {
-      this.snapInfo = decodeSnapshot(buf, this.pages, this.biz);
+      this.snapInfo = decodeSnapshot(buf, this.pages, this.biz, restoreKeys);
     } catch (err) {
       this.openNote = `snapshot rejected: ${(err as Error).message}`;
-      // 解码是「边读边填」的，抛错时内存里可能是半个索引——清干净再交给重放，
-      // 否则回退路径会把半个索引当底子继续往里填，最后得到一个又慢又错的状态。
-      this.pages.restoreSnapshot([], [], [], []);
-      this.biz.clear();
+      // 解码是「边读边填」的，抛错时内存里可能是半个索引——清干净再交给重放；
+      // 持久化 key 目录独立有效时则保留，不随普通快照一起回滚。
+      this.pages.restoreSnapshot([], [], [], [], restoreKeys);
+      this.biz.clear(restoreKeys);
       this.snapInfo = null;
       return false;
     }
@@ -228,6 +263,11 @@ export class Store {
   /** 把当前索引写成一份快照（epoch 没变就跳过）。返回是否真写了 */
   writeSnapshot(): boolean {
     return this._writeSnapshot();
+  }
+
+  /** 把统一 key 目录与二进制页目录物化；epoch 没变就跳过。 */
+  writeKeyIndex(): boolean {
+    return this._writeKeyIndex();
   }
 
   /** 从 shell 段重放索引；body 区段不扫（由 shell 里的 locator 引用） */
@@ -269,7 +309,7 @@ export class Store {
 
   /** 从页表重建位图索引（页表是唯一真相，索引只是加速结构） */
   private _rebuildBiz(): void {
-    this.biz.clear();
+    this.biz.clear(false);
     for (const [key, value] of this.pages.entries()) {
       this.biz.put(key, value);
     }
@@ -305,7 +345,7 @@ export class Store {
   private _allocRun(bytes: number): number {
     const off = this.meta.hwm;
     this.meta.hwm = off + bytes;
-    this.io.reserve(this.meta.hwm);
+    // 页表在提交时按区段写；定位写会自然扩展文件，不再为每个 4KB 页 ftruncate 一次。
     this.metaDirty = true; // equiv: hwm 直接长在 meta 对象上，写 meta 时必然带上；页表 persistDir 也会标脏
     return off;
   }
@@ -410,7 +450,7 @@ export class Store {
 
   put(ns: NsName | number, key: string, value: unknown): Promise<PutResult> {
     const n = F.nsId(ns);
-    return this.committer.submit<PutResult>(() => {
+    return this._submit<PutResult>(() => {
       const seq = this._nextSeq(n);
       const t = Date.now();
       this._appendShell(n, Buffer.from(JSON.stringify({ op: 'p', k: key, v: value, t, q: seq }) + '\n', 'utf8'));
@@ -421,7 +461,7 @@ export class Store {
 
   putBody(ns: NsName | number, key: string, body: Uint8Array, value: unknown = null): Promise<PutResult> {
     const n = F.nsId(ns);
-    return this.committer.submit<PutResult>(() => {
+    return this._submit<PutResult>(() => {
       const seq = this._nextSeq(n);
       const t = Date.now();
       const loc = this._writeBodyExtent(n, F.frameBody(body));
@@ -433,7 +473,7 @@ export class Store {
 
   del(ns: NsName | number, key: string): Promise<PutResult> {
     const n = F.nsId(ns);
-    return this.committer.submit<PutResult>(() => {
+    return this._submit<PutResult>(() => {
       const seq = this._nextSeq(n);
       this._appendShell(n, Buffer.from(JSON.stringify({ op: 'd', k: key, t: Date.now(), q: seq }) + '\n', 'utf8'));
       this._dropFromIndex(n, key);
@@ -450,7 +490,7 @@ export class Store {
   /** 业务行写：页表 CoW + 位图同步更新 + 一次 group commit */
   bizPut(key: string, value: unknown): Promise<{ seq: number; rowid: number }> {
     const n = F.nsId('biz');
-    return this.committer.submit(() => {
+    return this._submit(() => {
       const seq = this._nextSeq(n);
       this.pages.put(key, value);
       const rowid = this.biz.put(key, value);
@@ -471,10 +511,11 @@ export class Store {
 
   bizDel(key: string): Promise<{ seq: number; removed: boolean }> {
     const n = F.nsId('biz');
-    return this.committer.submit(() => {
+    return this._submit(() => {
       const seq = this._nextSeq(n);
+      const rowid = this.biz.rowidOf(key);
       const removed = this.pages.delete(key);
-      this.biz.delete(key);
+      this.biz.delete(key, rowid);
       this._bumpBizEpoch();
       this.metaDirty = true; // equiv: pages.delete 要么 writePage（persistDir 标脏），要么 flushOpen 时落盘，总会走到
 
@@ -487,13 +528,18 @@ export class Store {
     return this.biz.query(filter);
   }
 
+  /** 只物化当前页；matched 是忽略 after / limit 的精确命中数。 */
+  bizQueryPage(filter: Filter = {}): { keys: string[]; rowids: number[]; matched: number } {
+    return this.biz.queryPage(filter);
+  }
+
   bizStats(): { pages: ReturnType<PageTable['stats']>; index: ReturnType<BizIndex['stats']> } {
     return { pages: this.pages.stats(), index: this.biz.stats() };
   }
 
   bizClear(): Promise<{ seq: number; rows: number }> {
     const n = F.nsId('biz');
-    return this.committer.submit(() => {
+    return this._submit(() => {
       const seq = this._nextSeq(n);
       const rows = this.biz.size;
       this.pages.clear();
@@ -508,6 +554,22 @@ export class Store {
     const e = this.get(ns, key);
     if (!e?.b) return null;
     return this.io.readAt(e.b.o, e.b.l);
+  }
+
+  /** 只读 body 的指定范围，避免预览时把整个大对象搬过 IPC。 */
+  getBodyRange(
+    ns: NsName | number,
+    key: string,
+    off = 0,
+    len = 4096
+  ): { bytes: Buffer; off: number; total: number } | null {
+    const e = this.get(ns, key);
+    if (!e?.b) return null;
+    const requestedOff = Number.isFinite(off) ? Math.trunc(off) : 0;
+    const requestedLen = Number.isFinite(len) ? Math.trunc(len) : 0;
+    const start = Math.min(Math.max(0, requestedOff), e.b.l);
+    const size = Math.min(Math.max(0, requestedLen), e.b.l - start);
+    return { bytes: this.io.readAt(e.b.o + start, size), off: start, total: e.b.l };
   }
 
   bodyAt(loc: Locator): Buffer {
@@ -541,7 +603,7 @@ export class Store {
   /** 清空一个 ns：标记段组 dead → 尾部截断 → 其余登记为可复用空洞（§15.4 档位 A） */
   clearNs(ns: NsName | number): Promise<{ freedBytes: number; deadSegs: number; truncated: number }> {
     const n = F.nsId(ns);
-    return this.committer.submit(() => {
+    return this._submit(() => {
       let dead = 0;
       for (const seg of this.meta.segs) {
         if (seg.ns !== n || !seg.live) continue;
@@ -572,7 +634,9 @@ export class Store {
       dead.sort((a, b) => b.off - a.off);
       const last = dead[0]!;
       const end = last.off + F.SEG_HEADER_SIZE + last.cap;
-      if (end < this.io.size()) break; // 不是物理尾部，留着复用
+      // hwm 可能包含已分配但尚未写盘的 CoW 页；只看 io.size() 会把这些
+      // live 页误判成不存在，回退 hwm 后下一次分配就会覆盖它们。
+      if (end < Math.max(this.io.size(), this.meta.hwm)) break; // 不是物理/逻辑尾部，留着复用
       this.io.truncate(last.off);
       this.meta.hwm = Math.min(this.meta.hwm, last.off);
       this.meta.segs = this.meta.segs.filter((s) => s.id !== last.id);
@@ -670,6 +734,53 @@ export class Store {
     return true;
   }
 
+  /** 持久化统一 key 目录和二进制页目录；与普通快照共用 bizEpoch。 */
+  private _writeKeyIndex(): boolean {
+    const epoch = this.meta.bizEpoch ?? 0;
+    const cur = this.meta.keys;
+    if (cur && cur.epoch === epoch) return false;
+    if (this.directory.size === 0) {
+      if (cur) this._retireKeyIndex();
+      return false;
+    }
+    if (cur) this._retireKeyIndex();
+
+    const encoded = encodeKeyDirectory(this.directory, this.pages.snapshotDir(), 0, epoch);
+    const seg = this._registerSeg(F.NS_ID.sys!, F.T.KEYS, encoded.payload.length, encoded.payload.length, this.directory.size, 0);
+    const off = seg.off + F.SEG_HEADER_SIZE;
+    shiftKeyIndexOffsets(encoded.payload, encoded.meta, off);
+    seg.crc = crc32(encoded.payload);
+    this.io.writeAt(
+      F.encodeSegHeader({ id: seg.id, type: F.T.KEYS, ns: seg.ns, rows: this.directory.size, len: encoded.payload.length, crc: seg.crc }),
+      seg.off
+    );
+    this.io.writeAt(encoded.payload, off);
+    const m = encoded.meta;
+    this.meta.keys = {
+      seg: seg.id,
+      ...m,
+      off,
+      dirOff: m.dirOff + off,
+      primaryOff: m.primaryOff + off,
+      reverseOff: m.reverseOff + off,
+      indexOff: m.indexOff + off,
+      reverseIndexOff: m.reverseIndexOff + off,
+      bloomOff: m.bloomOff + off,
+    };
+    this.metaDirty = true; // equiv: flush() 随后无条件写 meta，赋值 false 也不改变落盘结果
+    return true;
+  }
+
+  private _retireKeyIndex(): void {
+    const keys = this.meta.keys;
+    if (!keys) return;
+    const seg = this.segById.get(keys.seg);
+    if (seg) seg.live = false;
+    this.meta.keys = undefined;
+    this.metaDirty = true; // equiv: flush() 随后无条件写 meta，赋值 false 也不改变落盘结果
+    this._reclaimTail();
+  }
+
   /** 退役旧快照：标 dead 后交给尾部回收，能在尾部就直接截掉 */
   private _retireSnapshot(): void {
     const snap = this.meta.snap;
@@ -694,21 +805,32 @@ export class Store {
     this.seqsDirty = false; // equiv: 只有 _flushNow 读它，而下一次提交碰 seq 就会重新置 true
   }
 
+  private _submit<T>(op: () => T): Promise<T> {
+    if (this.closing || this.closed) return Promise.reject(new Error('store is closing or closed'));
+    return this.committer.submit(op);
+  }
+
   async flush(): Promise<void> {
     await this.committer.drainNow();
     this.pool.flushAll();
     this.pages.flushOpen();
-    this._writeSnapshot(); // 先把快照段写下去，再写 meta（meta 才记这个指针）
+    this._writeKeyIndex();
+    this._writeSnapshot(); // 先把索引段写下去，再写 meta（meta 才记这些指针）
     this._writeMeta();
-    this.io.fsync();
+    await this.io.fsyncAsync();
   }
 
-  async close(): Promise<void> {
-    if (this.closed) return;
-    await this.flush();
-    this.pool.clear();
-    this.io.close();
-    this.closed = true;
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    // 必须在第一次 await 之前拒绝新提交；drainNow 只负责关闭前已经接受的操作。
+    this.closing = true;
+    this.closePromise = (async () => {
+      await this.flush();
+      this.pool.clear();
+      this.io.close();
+      this.closed = true;
+    })();
+    return this.closePromise;
   }
 
   // ---------------- 诊断 ----------------
@@ -717,12 +839,14 @@ export class Store {
     let shell = 0;
     let body = 0;
     let snapSegs = 0;
+    let keySegs = 0;
     let dead = 0;
     let allocated = 0;
     for (const s of this.meta.segs) {
       if (s.type === F.T.SHELL) shell++;
       else if (s.type === F.T.BODY) body++;
       else if (s.type === F.T.SNAP) snapSegs++;
+      else if (s.type === F.T.KEYS) keySegs++;
       if (!s.live) dead++;
       allocated += F.SEG_HEADER_SIZE + s.cap;
     }
@@ -735,7 +859,7 @@ export class Store {
       bytesLogical: this.io.size(),
       bytesAllocated: F.DATA_OFF + allocated,
       segSize: this.shellCap,
-      segs: { shell, body, free: this.freeSpans.length, snapshot: snapSegs },
+      segs: { shell, body, free: this.freeSpans.length, snapshot: snapSegs, keys: keySegs },
       deadSegs: dead,
       pendingReclaim: this.meta.pending.length,
       records,

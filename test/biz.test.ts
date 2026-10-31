@@ -4,7 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Store } from '../src/store.ts';
-import { bruteForce } from '../src/bizindex.ts';
+import { BizIndex, bruteForce } from '../src/bizindex.ts';
+import { Bitmap } from '../src/bitmap.ts';
 import type { Filter } from '../src/bizindex.ts';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mstore-biz-'));
@@ -192,6 +193,143 @@ test('分页游标：after + limit 等价于切片', async () => {
   await db.close();
 });
 
+test('queryPage：只返回当前页，matched 不受 after / limit 影响', async () => {
+  const db = Store.create(file());
+  await seed(db, 50);
+
+  const all = db.bizQuery({ eq: { dept: 'QA' } }).keys;
+  const first = db.bizQueryPage({ eq: { dept: 'QA' }, limit: 5 });
+  assert.equal(first.matched, all.length);
+  assert.deepEqual(first.keys, all.slice(0, 5));
+
+  const second = db.bizQueryPage({ eq: { dept: 'QA' }, after: first.keys.at(-1), limit: 5 });
+  assert.equal(second.matched, all.length, '翻页不能把游标之前的行从总命中数里扣掉');
+  assert.deepEqual(second.keys, all.slice(5, 10));
+
+  const numericAll = db.bizQuery({ gte: { level: 4 } }).keys;
+  const numeric = db.bizQueryPage({ gte: { level: 4 }, limit: 7 });
+  assert.equal(numeric.matched, numericAll.length);
+  assert.deepEqual(numeric.keys, numericAll.slice(0, 7));
+  const numericNext = db.bizQueryPage({ gte: { level: 4 }, after: numeric.keys.at(-1), limit: 7 });
+  assert.equal(numericNext.matched, numericAll.length);
+  assert.deepEqual(numericNext.keys, numericAll.slice(7, 14));
+
+  const multiFilter = { gte: { level: 0, updated_at: 0 }, limit: 5 };
+  const multi = db.bizQueryPage(multiFilter);
+  assert.equal(multi.matched, 50);
+  const multiNext = db.bizQueryPage({ ...multiFilter, after: multi.keys.at(-1) });
+  assert.equal(multiNext.matched, 50);
+  assert.deepEqual(multiNext.keys, db.bizQuery({ gte: multiFilter.gte }).keys.slice(5, 10));
+
+  const emptyEnumPage = db.bizQueryPage({ eq: { dept: 'QA' }, limit: 0 });
+  assert.equal(emptyEnumPage.matched, all.length);
+  assert.deepEqual(emptyEnumPage.keys, []);
+  const emptyNumPage = db.bizQueryPage({ gte: { level: 4 }, limit: 0 });
+  assert.equal(emptyNumPage.matched, numericAll.length);
+  assert.deepEqual(emptyNumPage.keys, []);
+  assert.deepEqual(db.bizQuery({ gte: { level: 4 }, limit: 0 }).keys, []);
+  await db.close();
+});
+
+test('取满一页后停止候选遍历，不为了 limit 扫描剩余命中行', async () => {
+  const db = Store.create(file());
+  await seed(db, 50);
+  const original = Bitmap.prototype.forEachWhile;
+  let visited = 0;
+  Bitmap.prototype.forEachWhile = function (cb) {
+    return original.call(this, (rowid) => {
+      visited++;
+      return cb(rowid);
+    });
+  };
+  try {
+    db.bizQueryPage({ eq: { dept: 'QA' }, limit: 5 });
+    assert.equal(visited, 6, '第 6 个候选发现已取满后必须停止');
+    visited = 0;
+    db.bizQuery({ gte: { level: 0 }, limit: 5 });
+    assert.equal(visited, 6, '单列普通查询不能扫描剩余命中行');
+    visited = 0;
+    db.bizQuery({ gte: { level: 0, updated_at: 0 }, limit: 5 });
+    assert.equal(visited, 6, '双列普通查询也不能扫描剩余命中行');
+  } finally {
+    Bitmap.prototype.forEachWhile = original;
+  }
+  await db.close();
+});
+
+test('枚举行字典在容量边界只按需扩一倍', () => {
+  const idx = new BizIndex(['dept'], []);
+  for (let i = 0; i < 1023; i++) idx.put(`k${i}`, { dept: 'R&D' });
+  const before = idx.snapshotEnums()[0]!.rows;
+  idx.put('k1023', { dept: 'R&D' });
+  assert.equal(idx.snapshotEnums()[0]!.rows, before, '容量已够时不能多分配一个同长度数组');
+  idx.put('k1024', { dept: 'R&D' });
+  assert.equal(idx.snapshotEnums()[0]!.rows.length, 2048);
+
+  const keys = Array.from({ length: 1023 }, (_, i) => `b${i}`);
+  const alive = new Bitmap(1024);
+  for (let i = 0; i < keys.length; i++) alive.set(i);
+  const boundary = new BizIndex(['dept'], []);
+  boundary.restoreSnapshot({
+    keys,
+    enums: [{ field: 'dept', rows: new Uint32Array(512), values: [{ value: 'R&D', bitmap: alive.clone() }] }],
+    nums: [],
+    alive,
+    state: { nextRowid: 1023, liveCount: 1023, capacity: 512 },
+  });
+  boundary.put('b1023', { dept: 'R&D' });
+  assert.equal(boundary.snapshotEnums()[0]!.rows.length, 1024, '从 512 扩到 1024 后必须停止');
+});
+
+test('restoreSnapshot 清除旧 key 并跳过 rowid 洞', () => {
+  const idx = new BizIndex(['dept'], ['ms']);
+  idx.put('old', { dept: 'R&D', ms: 1 });
+  const alive = new Bitmap(4);
+  alive.set(0);
+  alive.set(2);
+  idx.restoreSnapshot({
+    keys: ['a', undefined, 'c'],
+    enums: [],
+    nums: [],
+    alive,
+    state: { nextRowid: 3, liveCount: 2, capacity: 4 },
+  });
+  assert.equal(idx.rowidOf('old'), undefined);
+  assert.equal(idx.rowidOf('a'), 0);
+  assert.equal(idx.rowidOf('c'), 2);
+  assert.equal(idx.keyOf(1), undefined);
+  assert.deepEqual(idx.query({}).keys, ['a', 'c']);
+
+  idx.restoreSnapshot({
+    keys: [],
+    enums: [],
+    nums: [],
+    alive,
+    state: { nextRowid: 3, liveCount: 2, capacity: 4 },
+  }, false, true);
+  assert.deepEqual(idx.query({}).keys, ['a', 'c'], 'restoreKeys=false 时不能再清空目录');
+});
+
+test('高基数枚举：快照恢复后更新、缺字段和删除都只影响目标行', async () => {
+  const f = file();
+  const opts = { bizEnumFields: ['type'], bizNumFields: [] };
+  let db = Store.create(f, opts);
+  await Promise.all(Array.from({ length: 200 }, (_, i) => db.bizPut(`k_${i}`, { type: `value_${i}` })));
+  await db.close();
+
+  db = Store.open(f, opts);
+  assert.equal(db.openPath, 'snapshot');
+  await db.bizPut('k_0', { type: 'updated' });
+  await db.bizPut('k_1', { name: '字段被移除' });
+  await db.bizDel('k_2');
+  assert.deepEqual(db.bizQuery({ eq: { type: 'value_0' } }).keys, []);
+  assert.deepEqual(db.bizQuery({ eq: { type: 'updated' } }).keys, ['k_0']);
+  assert.deepEqual(db.bizQuery({ eq: { type: 'value_1' } }).keys, []);
+  assert.deepEqual(db.bizQuery({ eq: { type: 'value_2' } }).keys, []);
+  assert.deepEqual(db.bizQuery({ eq: { type: 'value_3' } }).keys, ['k_3']);
+  await db.close();
+});
+
 test('清空业务数据：行与索引一起归零，页目录重置', async () => {
   const f = file();
   const db = Store.create(f);
@@ -222,5 +360,19 @@ test('索引一致性：每个枚举值的位图 ≡ 全表扫描', async () => 
     const viaScan = Array.from({ length: 64 }, (_, i) => `k_${i}`).filter((k) => (db.bizGet(k) as { dept: string }).dept === dept);
     assert.deepEqual(viaBitmap, viaScan, `${dept} 的位图与扫描不一致`);
   }
+  await db.close();
+});
+
+test('replay 的首行 rowid=0 也要推进 nextRowid，新行从 1 开始', async () => {
+  const f = file();
+  let db = Store.create(f);
+  await db.bizPut('only', { dept: 'R&D', level: 1 });
+  await db.close();
+
+  db = Store.open(f, { snapshot: false });
+  assert.equal(db.biz.rowidOf('only'), 0);
+  const added = await db.bizPut('next', { dept: 'R&D', level: 2 });
+  assert.equal(added.rowid, 1, '已见 rowid=0 时 nextRowid 必须越过 0');
+  assert.equal(new Set(db.bizQuery({}).keys).size, 2);
   await db.close();
 });

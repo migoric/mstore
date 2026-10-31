@@ -11,6 +11,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { Store } from '../src/store.ts';
 import { crc32 } from '../src/crc32.ts';
+import { PageTable } from '../src/pagetable.ts';
+import { BizIndex } from '../src/bizindex.ts';
+import { MemoryKeyDirectory } from '../src/keydir.ts';
+import { encodeSnapshot, decodeSnapshot } from '../src/snapshot.ts';
 import * as F from '../src/format.ts';
 import type { Filter } from '../src/bizindex.ts';
 import type { Meta } from '../src/types.ts';
@@ -366,4 +370,88 @@ test('空库不写快照：不浪费一个段', async () => {
   assert.equal(r.openPath, 'replay');
   assert.equal(r.openNote, 'no snapshot');
   await r.close();
+});
+
+test('页目录物理偏移超过 4GB 仍能无损往返', () => {
+  const offsets = [0, 2 ** 32 + 12345, Number.MAX_SAFE_INTEGER];
+  const io = {
+    readAt: () => Buffer.alloc(4096),
+    writeAt: () => {},
+  };
+  const source = new PageTable(io, { pageDir: offsets } as Meta, () => 0, () => {});
+  source.load();
+  const encoded = encodeSnapshot(source, new BizIndex([], []));
+
+  const restoredPages = new PageTable(io, {} as Meta, () => 0, () => {});
+  const restoredBiz = new BizIndex([], []);
+  decodeSnapshot(encoded, restoredPages, restoredBiz);
+  assert.deepEqual(restoredPages.snapshotDir(), offsets);
+});
+
+test('默认内存快照恢复全部 key、rowid、值和行数', () => {
+  const data = Buffer.alloc(8192);
+  const io = {
+    readAt: (off: number, len: number) => data.subarray(off, off + len),
+    writeAt: (buf: Buffer, off: number) => { buf.copy(data, off); },
+  };
+  const directory = new MemoryKeyDirectory();
+  const pages = new PageTable(io, {} as Meta, () => 4096, () => {}, { directory });
+  const biz = new BizIndex(['dept'], [], directory);
+  pages.put('a', { dept: 'R&D' });
+  biz.put('a', { dept: 'R&D' });
+  pages.flushOpen();
+  const encoded = encodeSnapshot(pages, biz);
+
+  const restoredDirectory = new MemoryKeyDirectory();
+  const restoredPages = new PageTable(io, {} as Meta, () => 0, () => {}, { directory: restoredDirectory });
+  const restoredBiz = new BizIndex(['dept'], [], restoredDirectory);
+  const info = decodeSnapshot(encoded, restoredPages, restoredBiz);
+  assert.deepEqual(restoredPages.get('a'), { dept: 'R&D' });
+  assert.equal(restoredBiz.rowidOf('a'), 0);
+  assert.equal(restoredBiz.keyOf(0), 'a');
+  assert.equal(info.rows, 1);
+});
+
+test('新编码器把缺 rowid 的页表 key 写成 LOOSE，而不是伪造 rowid 0', () => {
+  const data = Buffer.alloc(8192);
+  const io = {
+    readAt: (off: number, len: number) => data.subarray(off, off + len),
+    writeAt: (buf: Buffer, off: number) => { buf.copy(data, off); },
+  };
+  const pages = new PageTable(io, {} as Meta, () => 4096, () => {});
+  pages.put('loose', { value: 1 });
+  pages.flushOpen();
+  const encoded = encodeSnapshot(pages, new BizIndex([], []));
+
+  const restored = new PageTable(io, {} as Meta, () => 0, () => {});
+  const info = decodeSnapshot(encoded, restored, new BizIndex([], []));
+  assert.equal(info.loose, 1);
+  assert.deepEqual([...restored.snapshotEntries()], [['loose', { logical: 0, rowid: undefined }]]);
+});
+
+test('旧格式 LOOSE 记录仍能恢复到统一目录', () => {
+  const io = {
+    readAt: () => Buffer.alloc(4096),
+    writeAt: () => {},
+  };
+  const encoded = encodeSnapshot(new PageTable(io, {} as Meta, () => 0, () => {}), new BizIndex([], []));
+  let at = 12;
+  while (at < encoded.length) {
+    if (encoded.readUInt8(at) === 3) break;
+    at += 8 + encoded.readUInt32LE(at + 4);
+  }
+  const oldLen = encoded.readUInt32LE(at + 4);
+  const record = Buffer.alloc(8);
+  record.writeUInt32LE(0, 0);
+  record.writeUInt32LE(6, 4);
+  const legacy = Buffer.from('legacy', 'utf8');
+  const end = at + 8 + oldLen;
+  const patched = Buffer.concat([encoded.subarray(0, end), record, legacy, encoded.subarray(end)]);
+  patched.writeUInt32LE(oldLen + record.length + legacy.length, at + 4);
+  patched.writeUInt32LE(1, at + 8);
+
+  const restoredPages = new PageTable(io, {} as Meta, () => 0, () => {});
+  const info = decodeSnapshot(patched, restoredPages, new BizIndex([], []));
+  assert.equal(info.loose, 1);
+  assert.deepEqual([...restoredPages.snapshotEntries()], [['legacy', { logical: 0, rowid: undefined }]]);
 });

@@ -8,6 +8,8 @@ export type { Filter, BizIndexStats } from './bizindex.ts';
 export { crc32, crc32Impl } from './crc32.ts';
 export { cloneFile, Io } from './io.ts';
 export { Committer } from './committer.ts';
+export { MemoryKeyDirectory, PersistentKeyDirectory } from './keydir.ts';
+export type { KeyDirectory, KeyRecord } from './keydir.ts';
 export { BufferPool, SegmentBuffer } from './bufferpool.ts';
 export * as fmt from './format.ts';
 export type {

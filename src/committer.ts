@@ -10,7 +10,7 @@
  */
 export interface CommitterOpts {
   flush: () => void;
-  fsync: () => void;
+  fsync: () => void | Promise<void>;
   minWindow?: number;
   maxWindow?: number;
 }
@@ -35,7 +35,7 @@ export interface CommitReport {
 
 export class Committer {
   private flush: () => void;
-  private fsync: () => void;
+  private fsync: () => void | Promise<void>;
   private minWindow: number;
   private maxWindow: number;
   private queue: Item<unknown>[] = [];
@@ -58,51 +58,77 @@ export class Committer {
   submit<T>(op: () => T): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       this.queue.push({ op, resolve: resolve as (v: unknown) => void, reject });
-      if (!this.timer) this.timer = setTimeout(() => this._drain(), this.window);
+      // 队首请求立刻安排提交，不等满整个窗口。
+      //
+      // 窗口的作用是「让后来者搭上车」，不是「让第一个请求先罚站」。
+      // 串行 `for (…) await put(…)` 时队列里永远只有 1 个 op，等满窗口就是纯延迟：
+      // 实测 window=40ms + fsync=20ms → 每条 60ms（16 行/秒），
+      // 而同一份数据并发提交能到 2824 行/秒。差的那 40ms 一点活都没干。
+      //
+      // 用 0ms 定时器：同一个 tick 内 submit 的后续 op 仍然并进这一批（group commit
+      // 不受影响），单条也不再空等；而 fsync 本身那 20ms 期间到达的 op 会自然攒到
+      // 下一轮——真正的合批能力来自 fsync 在途，不来自空等。
+      if (!this.timer) this.timer = setTimeout(() => this._drain(), 0);
     });
   }
 
-  private _drain(): void {
+  private active: Promise<void> | null = null;
+
+  private _drain(): Promise<void> {
     this.timer = null;
-    const batch = this.queue;
-    if (batch.length === 0) return;
-    this.queue = [];
-
-    const results: unknown[] = [];
-    try {
-      for (const item of batch) results.push(item.op());
-    } catch (err) {
-      for (const item of batch) item.reject(err);
-      return;
-    }
-
-    try {
-      this.flush(); // 数据写 + 可能写 meta，全在同一次 fsync 覆盖范围内
-      const t0 = process.hrtime.bigint();
-      this.fsync();
-      const t1 = process.hrtime.bigint();
-      const syncMs = Number(t1 - t0) / 1e6;
-      // ewma：0.7 旧 + 0.3 新，避免单次抖动带偏窗口
-      this.fsyncMs = this.fsyncMs * 0.7 + syncMs * 0.3;
-      this.stats.commits++;
-      this.stats.ops += batch.length;
-      this.stats.batches++;
-      this.stats.maxBatch = Math.max(this.stats.maxBatch, batch.length);
-      this.stats.totalMs += syncMs;
-    } catch (err) {
-      for (const item of batch) item.reject(err);
-      return;
-    }
-
-    for (let i = 0; i < batch.length; i++) batch[i]!.resolve(results[i]);
+    if (this.active) return this.active;
+    const run = this._run();
+    this.active = run;
+    void run.finally(() => {
+      if (this.active === run) this.active = null;
+      if (this.queue.length && !this.timer) this.timer = setTimeout(() => void this._drain(), 0);
+    });
+    return run;
   }
+
+  /** 只有一个 _run 可进入 fsync；等待期间到达的请求留给下一批。 */
+  private async _run(): Promise<void> {
+    while (this.queue.length) {
+      const batch = this.queue;
+      this.queue = [];
+      const results: unknown[] = [];
+      try {
+        for (const item of batch) results.push(item.op());
+      } catch (err) {
+        for (const item of batch) item.reject(err);
+        continue;
+      }
+
+      try {
+        this.flush(); // 数据写 + 可能写 meta，全在同一次 fsync 覆盖范围内
+        const t0 = process.hrtime.bigint();
+        await this.fsync();
+        const t1 = process.hrtime.bigint();
+        const syncMs = Number(t1 - t0) / 1e6;
+        // ewma：0.7 旧 + 0.3 新，避免单次抖动带偏窗口
+        this.fsyncMs = this.fsyncMs * 0.7 + syncMs * 0.3;
+        this.stats.commits++;
+        this.stats.ops += batch.length;
+        this.stats.batches++;
+        this.stats.fsyncs++;
+        this.stats.maxBatch = Math.max(this.stats.maxBatch, batch.length);
+        this.stats.totalMs += syncMs;
+      } catch (err) {
+        for (const item of batch) item.reject(err);
+        continue;
+      }
+
+      for (let i = 0; i < batch.length; i++) batch[i]!.resolve(results[i]);
+    }
+  }
+
   /** 等待队列清空（flush() / close() 用） */
   async drainNow(): Promise<void> {
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
     }
-    this._drain();
+    await this._drain();
     if (this.queue.length) await this.drainNow();
   }
 

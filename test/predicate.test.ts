@@ -161,6 +161,7 @@ test('clear 之后块统计一起归零，不再命中旧行', () => {
   const { idx } = build(100);
   idx.clear();
   assert.equal(idx.size, 0);
+  assert.equal(idx.rowidOf('u_0'), undefined, 'clear 必须同时移除目录 key');
   assert.deepEqual(idx.query({ gte: { ms: 0 } }).keys, []);
   // 重新写入后仍可查
   idx.put('a', { dept: 'QA', ms: 42 });

@@ -1,6 +1,6 @@
 /**
  * IO 薄层：一个 fd、定块读写、fsync 计数、截断、打洞能力探测。
- * 全部走同步系统调用 —— 存储层不碰事件循环，异步交给上层协议层。
+ * 数据读写保持同步以简化单写者顺序；刷盘提供异步接口，避免等待时阻塞事件循环。
  */
 import fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
@@ -67,6 +67,19 @@ export class Io {
   fsync(): void {
     fs.fsyncSync(this.fd);
     this.fsyncCount++;
+  }
+
+  /** 同一个 fd 的异步全量刷盘；等待期间不阻塞 Node 事件循环。 */
+  fsyncAsync(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      fs.fsync(this.fd, (err) => {
+        if (err) reject(err);
+        else {
+          this.fsyncCount++;
+          resolve();
+        }
+      });
+    });
   }
 
   /**

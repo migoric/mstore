@@ -14,6 +14,7 @@ import type { Meta } from '../src/types.ts';
 /** 线性分配的内存盘：off 从 0 开始往后长，读越界给空 */
 class MemIo implements PageIo {
   buf = Buffer.alloc(4 << 20);
+  writes: Array<{ off: number; len: number }> = [];
   // 页表用偏移 0 表示「目录项无效」，所以内存盘也要跳过 0 开始分配（真库前面有 2MB 头）
   used = 1;
 
@@ -28,6 +29,7 @@ class MemIo implements PageIo {
   }
 
   writeAt(b: Buffer, off: number): void {
+    this.writes.push({ off, len: b.length });
     b.copy(this.buf, off);
   }
 }
@@ -39,7 +41,7 @@ interface Rig {
   dirty: () => number;
 }
 
-function rig(opts: { pageSize?: number; rowsPerPage?: number } = {}): Rig {
+function rig(opts: { pageSize?: number; rowsPerPage?: number; pageCachePages?: number } = {}): Rig {
   const io = new MemIo();
   const meta = {} as unknown as Meta;
   let dirtyCount = 0;
@@ -88,6 +90,78 @@ test('新行先攒在内存：可见但不落盘，flush 之后页目录才有�
   assert.ok(io.readAt(dirOf(meta)[0]!, 4096).readUInt16LE(0) > 0, '页头写了 JSON 长度');
 });
 
+test('同一批连续页合并成一次大写，重复 flush 不重复写', () => {
+  const { io, table } = rig({ rowsPerPage: 2 });
+  for (let i = 0; i < 6; i++) table.put(`k${i}`, { i });
+  assert.equal(io.writes.length, 0, '满页轮转只进脏页队列，不逐页写盘');
+
+  table.flushOpen();
+  assert.deepEqual(io.writes, [{ off: 1, len: 3 * 4096 }], '三个连续页必须合并成一次 12KB 写');
+  table.flushOpen();
+  assert.equal(io.writes.length, 1, '脏页已经清空，重复 flush 不能再写');
+  for (let i = 0; i < 6; i++) assert.deepEqual(table.get(`k${i}`), { i });
+});
+
+test('关闭页缓存时，未提交脏页仍返回最新值', () => {
+  const { io, meta, table } = rig({ rowsPerPage: 1, pageCachePages: 0 });
+  table.put('a', { v: 'old' });
+  table.put('b', { v: 'other' });
+  table.put('a', { v: 'new' });
+  assert.deepEqual(table.get('a'), { v: 'new' });
+  assert.deepEqual([...table.entries()], [
+    ['a', { v: 'new' }],
+    ['b', { v: 'other' }],
+  ]);
+
+  table.flushOpen();
+  const again = new PageTable(io, meta, (x) => io.alloc(x), () => {}, { pageCachePages: 0 });
+  again.load();
+  assert.deepEqual(again.get('a'), { v: 'new' });
+  assert.deepEqual(again.get('b'), { v: 'other' });
+});
+
+test('页缓存命中且返回深拷贝，调用方不能污染缓存', () => {
+  const { io, meta, table } = rig({ rowsPerPage: 1, pageCachePages: 1 });
+  table.put('a', { nested: { value: 'old' } });
+  assert.equal(table.stats().cachedPages, 1, '空缓存首次插入必须留下该页');
+  table.put('b', { v: 'other' });
+  table.flushOpen();
+
+  const cached = new PageTable(io, meta, (x) => io.alloc(x), () => {}, { pageCachePages: 1 });
+  cached.load();
+  assert.deepEqual(cached.get('a'), { nested: { value: 'old' } });
+  assert.deepEqual(cached.get('a'), { nested: { value: 'old' } });
+  assert.ok(cached.cacheHits >= 1, '空缓存第二次读必须命中');
+  assert.equal(cached.stats().cachedPages, 1, '容量为 1 时必须在插入后留下当前页');
+  const detached = cached.get('a') as { nested: { value: string } };
+  detached.nested.value = 'mutated';
+  assert.deepEqual(cached.get('a'), { nested: { value: 'old' } });
+});
+
+test('原始输入与 entries 返回值都不能绕过深拷贝污染缓存', () => {
+  const { table } = rig({ rowsPerPage: 1, pageCachePages: 4 });
+  const input = { nested: { value: 'old' } };
+  table.put('a', input);
+  table.flushOpen();
+  input.nested.value = 'mutated-input';
+  assert.deepEqual(table.get('a'), { nested: { value: 'old' } }, '写入必须断开与调用方对象的引用');
+
+  const rows = [...table.entries()];
+  (rows[0]![1] as { nested: { value: string } }).nested.value = 'mutated-entry';
+  assert.deepEqual(table.get('a'), { nested: { value: 'old' } }, '遍历返回也必须是副本');
+});
+
+test('pageCachePages=0 不经过 LRU 命中路径', () => {
+  const { table } = rig({ rowsPerPage: 1, pageCachePages: 0 });
+  table.put('a', { v: 'value' });
+  table.flushOpen();
+  assert.deepEqual(table.get('a'), { v: 'value' });
+  assert.deepEqual(table.get('a'), { v: 'value' });
+  assert.equal(table.cacheHits, 0);
+  assert.equal(table.cacheMisses, 0);
+  assert.equal(table.stats().cachedPages, 0, '禁用缓存时写路径也不能留页');
+});
+
 test('open 页内更新：只改缓冲，不触发整页重写', () => {
   const { table } = rig({ rowsPerPage: 48 });
   table.put('k1', { a: 1 });
@@ -101,6 +175,7 @@ test('open 页内更新：只改缓冲，不触发整页重写', () => {
 test('关闭页更新走 CoW：写新偏移，旧页字节原样保留', () => {
   const { io, meta, table } = rig({ rowsPerPage: 1 }); // 一行一页，写完立刻关闭
   table.put('k1', { v: 'old' });
+  table.flushOpen();
   const oldOff = dirOf(meta)[0]!;
   const oldBytes = Buffer.from(io.readAt(oldOff, 4096));
 
@@ -129,6 +204,29 @@ test('open 页内更新变大装不下：把这一行搬出去，不丢数据', 
 
   table.flushOpen();
   assert.equal(table.stats().rows, 2);
+});
+
+test('迁出行恰好等于单页上限：必须成功迁移而不是误报超页', () => {
+  const { table } = rig({ pageSize: 256, rowsPerPage: 48 });
+  table.put('a', 's'.repeat(10));
+  table.put('c', 's'.repeat(10));
+  const exact = sized('a', 244); // frameBytes = 8 + 244 = cap(252)
+  table.put('a', exact.v);
+
+  assert.equal(table.size(), 2);
+  assert.equal(table.get('a'), exact.v);
+  assert.equal(table.get('c'), 's'.repeat(10));
+});
+
+test('snapshotIndex 兼容包装返回 key → 逻辑页号且不含无效项', () => {
+  const { table } = rig({ rowsPerPage: 1 });
+  table.put('a', { v: 1 });
+  table.put('b', { v: 2 });
+  table.flushOpen();
+  const index = table.snapshotIndex();
+  assert.equal(index.size, 2);
+  assert.equal(index.get('a'), 0, 'logical 0 是合法页号，不能被过滤掉');
+  assert.equal(index.get('b'), 1);
 });
 
 test('同一页放进变大的行：openBytes 跟着 delta 走，不重复计数', () => {
@@ -217,6 +315,7 @@ test('load 从 meta.pageDir 恢复索引，跳过占位 0', () => {
   const { io, meta, table } = rig({ pageSize: 4096, rowsPerPage: 2 });
   table.put('a', 'A');
   table.put('b', 'B');
+  table.flushOpen();
   table.put('c', 'C'); // 开了一页但没落盘 → 目录里有占位 0
   assert.equal(table.stats().pages, 1);
   assert.equal(table.size(), 3);

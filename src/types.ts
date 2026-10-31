@@ -52,6 +52,29 @@ export interface SnapMeta {
   at: number;
 }
 
+export interface KeyIndexMeta {
+  seg: number;
+  off: number;
+  len: number;
+  crc: number;
+  epoch: number;
+  rows: number;
+  dirOff: number;
+  dirCount: number;
+  /** 二进制页目录的 CRC；损坏时整份 key 索引回退为逐页扫描 */
+  dirCrc: number;
+  primaryOff: number;
+  primaryCount: number;
+  reverseOff: number;
+  reverseCount: number;
+  indexOff: number;
+  indexLen: number;
+  reverseIndexOff: number;
+  reverseIndexLen: number;
+  bloomOff: number;
+  bloomLen: number;
+}
+
 export interface Meta {
   gen: number;
   segSize: number;
@@ -71,6 +94,8 @@ export interface Meta {
   bizEpoch?: number;
   /** 索引快照指针；不存在表示还没有快照 */
   snap?: SnapMeta;
+  /** 持久化 key 索引与二进制页目录；旧库没有该字段时走 JSON / 快照回退 */
+  keys?: KeyIndexMeta;
 }
 
 export interface Entry {
@@ -105,7 +130,7 @@ export interface StoreStats {
   bytesLogical: number;
   bytesAllocated: number;
   segSize: number;
-  segs: { shell: number; body: number; free: number; snapshot: number };
+  segs: { shell: number; body: number; free: number; snapshot: number; keys: number };
   deadSegs: number;
   pendingReclaim: number;
   records: Record<string, number>;

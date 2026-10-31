@@ -22,10 +22,11 @@ src/
   io.ts          裸 fd 读写：pread/pwrite/fsync/ftruncate + APFS clonefile
   bitmap.ts      定长位图（enum 值索引、alive 标记）—— 手写 Uint32Array，不用 Set
   bufferpool.ts  段缓冲区：shell 段预分配 1MB，攒够一批再写；body 段精确长度
-  committer.ts   提交协调：单 fsync 点、按窗口合并、pending 队列
-  pagetable.ts   CoW 页表：key → logical page，页内 JSON 行数组，脏页只在 commit 时落
-  bizindex.ts    业务索引：key → rowid、rowid ↔ key、enum 位图、数值列 Float64Array、活行位图
-  snapshot.ts    索引快照编解码（二进制，7 种块），冷启动走它而不是逐页重放
+  committer.ts   提交协调：单 fsync 在途、异步等待、pending 队列，读不被刷盘阻塞
+  pagetable.ts   CoW 页表：key → logical page，页内 JSON 行数组；脏页在 commit 时按偏移合并写
+  bizindex.ts    业务索引：enum 位图、数值列 Float64Array、活行位图；与页表共享 key 目录
+  keydir.ts      统一 key 目录：内存 Map / 磁盘有序块 + 稀疏索引 + Bloom + rowid 反查 + 二进制页目录
+  snapshot.ts    索引快照编解码（二进制，7 种块）；命中 keydir 时跳过 ROWS 字符串解码
   store.ts       Store 门面：open/create/close、三层 API（biz / ns shell / body）、flush、check
   index.ts       公开导出面。新增导出只能加在这里，不要让人从 src/xxx.ts 深引
 
@@ -53,15 +54,16 @@ docs/scale-10g.md  撑到 10GB 的现状、瓶颈与四阶段改造（每阶段�
 
 ```bash
 npm run typecheck          # tsc 7.0.2，noEmit。必须零错误，CI 第一道门
-npm test                   # 122 个用例，约 58s（大头是 fsync）
+npm test                   # 156 个用例
 npm run mutate             # src/bitmap.ts       15/15  100%
-npm run mutate:index       # src/bizindex.ts     57/57  100%
-npm run mutate:page        # src/pagetable.ts    35/35  100%
-npm run mutate:snap        # src/snapshot.ts     24/24  100%
-npm run mutate:store       # src/store.ts        84/85  98.8%（含快照用例）
-npm run mutate:all         # 五组全跑（并行，约 5–8 分钟；日常只跑目标文件那组）
+npm run mutate:index       # src/bizindex.ts     69/69  100%
+npm run mutate:page        # src/pagetable.ts    52/52  100%
+npm run mutate:snap        # src/snapshot.ts     25/25  100%
+npm run mutate:keys        # src/keydir.ts       48/48  100%
+npm run mutate:store       # src/store.ts        99/99  100%
+npm run mutate:all         # 六组全跑（日常只跑目标文件那组）
 
-# 变异默认 4 个 worker 并行。单 worker 原地跑（调试用，会留下改写痕迹）：
+# 变异默认 4 个 worker 并行。单 worker 也只改临时副本（调试用）：
 node tools/mutate.ts --target src/bitmap.ts --tests test/bitmap.test.ts --workers 1
 
 npm run gen                # 生成 data/biz.db（30k 行）

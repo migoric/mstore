@@ -10,6 +10,8 @@
  * 预计算会随维度数指数爆炸，还失去「加筛选器不改磁盘格式」的自由。
  */
 import { Bitmap } from './bitmap.ts';
+import { MemoryKeyDirectory } from './keydir.ts';
+import type { KeyDirectory } from './keydir.ts';
 
 export type EnumColumns = Record<string, readonly string[]>;
 export type NumColumns = Record<string, readonly string[]>;
@@ -44,6 +46,11 @@ export interface BizIndexStats {
 interface EnumCol {
   kind: 'enum';
   bitmaps: Map<string, Bitmap>;
+  /** value → 1 起始字典 ID；0 表示这行没有该字段 */
+  ids: Map<string, number>;
+  values: string[];
+  /** rowid → 字典 ID，用于更新时只清旧值所在的位图 */
+  rows: Uint32Array;
 }
 
 /**
@@ -104,8 +111,7 @@ export interface ScanStats {
 }
 
 export class BizIndex {
-  private rowids = new Map<string, number>();
-  private keys: string[] = []; // rowid -> key
+  private directory: KeyDirectory;
   private nextRowid = 0;
   private enums: Record<string, EnumCol> = {};
   private nums: Record<string, NumCol> = {};
@@ -116,9 +122,20 @@ export class BizIndex {
   /** 上一次 query 的剪枝情况，见 ScanStats */
   lastScan: ScanStats = { blocks: 0, candidates: 0, scanned: 0, path: 'full' };
 
-  constructor(enumFields: string[] = [], numFields: string[] = []) {
-    for (const f of enumFields) this.enums[f] = { kind: 'enum', bitmaps: new Map() };
+  constructor(enumFields: string[] = [], numFields: string[] = [], directory?: KeyDirectory) {
+    this.directory = directory ?? new MemoryKeyDirectory();
+    for (const f of enumFields) this.enums[f] = BizIndex._newEnumCol(this.capacity);
     for (const f of numFields) this.nums[f] = BizIndex._newNumCol(this.capacity);
+  }
+
+  private static _newEnumCol(capacity: number): EnumCol {
+    return {
+      kind: 'enum',
+      bitmaps: new Map(),
+      ids: new Map(),
+      values: [],
+      rows: new Uint32Array(capacity),
+    };
   }
 
   private static _newNumCol(capacity: number): NumCol {
@@ -137,22 +154,41 @@ export class BizIndex {
   }
 
   rowidOf(key: string): number | undefined {
-    return this.rowids.get(key);
+    return this.directory.get(key)?.rowid;
   }
 
   keyOf(rowid: number): string | undefined {
-    return this.alive.get(rowid) ? this.keys[rowid] : undefined;
+    return this.alive.get(rowid) ? this.directory.getKey(rowid) : undefined;
   }
 
-  /** 装载/覆盖一行；已存在则原位更新（先清旧位，再置新位） */
+  /** 装载/覆盖一行；每个字段只清这行的旧字典值，不扫描整组位图。 */
   put(key: string, value: unknown, existingRowid?: number): number {
-    const rowid = existingRowid ?? this.rowids.get(key) ?? this._allocRow(key);
+    const rowid = existingRowid ?? this.directory.get(key)?.rowid ?? this._allocRow(key);
+    // replay 会按持久化目录里的旧 rowid 逐行重建，此时 _allocRow 不会执行。
+    // nextRowid 仍必须越过所有已见 rowid，否则重开后第一行又从 0 开始撞号。
+    if (rowid >= this.nextRowid) this.nextRowid = rowid + 1;
+    if (!this.alive.get(rowid)) {
+      this.alive.set(rowid);
+      this.liveCount++;
+    }
     const rec = (value ?? {}) as Record<string, unknown>;
-    this._clearBits(rowid);
     for (const [field, col] of Object.entries(this.enums)) {
+      this._ensureEnumCapacity(col, rowid + 1);
+      const oldId = col.rows[rowid]!;
+      if (oldId > 0) col.bitmaps.get(col.values[oldId - 1]!)?.clear(rowid); // equiv: oldId=0 时 values[-1] 为 undefined，可选链同样无操作
       const raw = rec[field];
-      if (raw === undefined || raw === null) continue;
+      if (raw === undefined || raw === null) {
+        col.rows[rowid] = 0;
+        continue;
+      }
       const v = String(raw);
+      let id = col.ids.get(v);
+      if (id === undefined) {
+        id = col.values.length + 1;
+        col.ids.set(v, id);
+        col.values.push(v);
+      }
+      col.rows[rowid] = id;
       let bm = col.bitmaps.get(v);
       if (!bm) {
         bm = new Bitmap(this.capacity);
@@ -168,22 +204,21 @@ export class BizIndex {
     return rowid;
   }
 
-  delete(key: string): void {
-    const rowid = this.rowids.get(key);
+  delete(key: string, existingRowid?: number): void {
+    const rowid = existingRowid ?? this.directory.get(key)?.rowid;
     if (rowid === undefined) return;
     this._clearBits(rowid);
     this.alive.clear(rowid);
-    this.rowids.delete(key);
+    this.directory.delete(key);
     this.liveCount--;
   }
 
-  clear(): void {
-    this.rowids.clear();
-    this.keys = [];
+  clear(clearDirectory = true): void {
+    if (clearDirectory) this.directory.clear();
     this.nextRowid = 0;
     this.liveCount = 0;
     this.alive = new Bitmap(1024);
-    for (const col of Object.values(this.enums)) col.bitmaps.clear();
+    for (const f of Object.keys(this.enums)) this.enums[f] = BizIndex._newEnumCol(this.capacity);
     for (const f of Object.keys(this.nums)) this.nums[f] = BizIndex._newNumCol(this.capacity);
   }
 
@@ -192,6 +227,16 @@ export class BizIndex {
    * 返回的 rowid 天然升序。
    */
   query(filter: Filter = {}): { rowids: number[]; keys: string[] } {
+    const { rowids, keys } = this._execute(filter, false);
+    return { rowids, keys };
+  }
+
+  /** 返回当前页，同时计算不受 after / limit 影响的精确命中数。 */
+  queryPage(filter: Filter = {}): { rowids: number[]; keys: string[]; matched: number } {
+    return this._execute(filter, true);
+  }
+
+  private _execute(filter: Filter, countMatches: boolean): { rowids: number[]; keys: string[]; matched: number } {
     let acc: Bitmap | null = null;
 
     for (const [field, want] of Object.entries(filter.eq ?? {})) {
@@ -204,7 +249,7 @@ export class BizIndex {
         if (!bm) continue;
         union = union ? union.or(bm) : bm.clone();
       }
-      if (!union) return { rowids: [], keys: [] }; // 该字段没有匹配值
+      if (!union) return { rowids: [], keys: [], matched: 0 }; // 该字段没有匹配值
       acc = acc ? acc.and(union) : union;
     }
 
@@ -220,7 +265,7 @@ export class BizIndex {
     const gteEntries = Object.entries(filter.gte ?? {});
     const lteEntries = Object.entries(filter.lte ?? {});
     const rowids: number[] = [];
-    const afterRowid = filter.after !== undefined ? this.rowids.get(filter.after) : undefined;
+    const afterRowid = filter.after !== undefined ? this.directory.get(filter.after)?.rowid : undefined;
     const limit = filter.limit ?? Number.MAX_SAFE_INTEGER;
 
     // 数值条件先解析成 NumCond，顺便守住旧语义：
@@ -228,12 +273,12 @@ export class BizIndex {
     const numConds: NumCond[] = [];
     for (const [field, min] of gteEntries) {
       const col = this.nums[field];
-      if (!col) return { rowids: [], keys: [] };
+      if (!col) return { rowids: [], keys: [], matched: 0 };
       numConds.push({ col, min });
     }
     for (const [field, max] of lteEntries) {
       const col = this.nums[field];
-      if (!col) return { rowids: [], keys: [] };
+      if (!col) return { rowids: [], keys: [], matched: 0 };
       numConds.push({ col, max });
     }
 
@@ -257,13 +302,17 @@ export class BizIndex {
      * 100 万行命中 100% 时实测慢 13%。`{gte, lte}` 落在同一列是压倒性常见的形状
      * （区间查询本来就这么写），把两个条件合并成 [max(lo), min(hi)] 之后内外完全等价。
      */
+    // 纯枚举查询可以直接 popcount，取页无需为了精确 matched 再扫全部命中行。
+    const countedByBitmap = countMatches && numConds.length === 0;
     type RowFn = (rowid: number) => boolean;
+    let matched = countedByBitmap ? acc.count() : 0;
     const makeRowFn = (cols: Float64Array[], los: number[], his: number[]): RowFn => {
       if (cols.length === 0) {
         return (rowid) => {
-          if (rowids.length >= limit) return false;
+          if ((!countMatches || countedByBitmap) && rowids.length >= limit) return false;
+          if (countMatches && !countedByBitmap) matched++;
           if (afterRowid !== undefined && rowid <= afterRowid) return true;
-          rowids.push(rowid);
+          if (rowids.length < limit) rowids.push(rowid); // equiv: 前置 guard 已在 length==limit 时停止，<= 不会多写
           return true;
         };
       }
@@ -276,17 +325,19 @@ export class BizIndex {
         const lo = cols.length === 1 ? los[0]! : Math.max(los[0]!, los[1]!);
         const hi = cols.length === 1 ? his[0]! : Math.min(his[0]!, his[1]!);
         return (rowid) => {
-          if (rowids.length >= limit) return false;
-          if (afterRowid !== undefined && rowid <= afterRowid) return true;
+          if (!countMatches && rowids.length >= limit) return false;
+          if (!countMatches && afterRowid !== undefined && rowid <= afterRowid) return true;
           const v = d[rowid]!;
           if (!(v >= lo && v <= hi)) return true;
-          rowids.push(rowid);
+          if (countMatches) matched++;
+          if (countMatches && afterRowid !== undefined && rowid <= afterRowid) return true;
+          if (rowids.length < limit) rowids.push(rowid); // equiv: 前置 guard 已在 length==limit 时停止，<= 不会多写
           return true;
         };
       }
       return (rowid) => {
-        if (rowids.length >= limit) return false;
-        if (afterRowid !== undefined && rowid <= afterRowid) return true;
+        if (!countMatches && rowids.length >= limit) return false;
+        if (!countMatches && afterRowid !== undefined && rowid <= afterRowid) return true;
         for (let i = 0; i < cols.length; i++) {
           // 一条比较链同时挡掉两种情况：
           //   NaN（任何比较都是 false）、越界的 data[rowid] 是 undefined（同样 false）。
@@ -294,7 +345,9 @@ export class BizIndex {
           const v = cols[i]![rowid]!;
           if (!(v >= los[i]! && v <= his[i]!)) return true;
         }
-        rowids.push(rowid);
+        if (countMatches) matched++;
+        if (countMatches && afterRowid !== undefined && rowid <= afterRowid) return true;
+        if (rowids.length < limit) rowids.push(rowid); // equiv: 前置 guard 已在 length==limit 时停止，<= 不会多写
         return true;
       };
     };
@@ -343,7 +396,7 @@ export class BizIndex {
       }
     }
 
-    return { rowids, keys: rowids.map((r) => this.keys[r]!) };
+    return { rowids, keys: rowids.map((r) => this.directory.getKey(r)!), matched };
   }
 
   stats(): BizIndexStats {
@@ -362,15 +415,23 @@ export class BizIndex {
 
   private _allocRow(key: string): number {
     const rowid = this.nextRowid++;
-    this.keys[rowid] = key;
     this.alive.set(rowid);
-    this.rowids.set(key, rowid);
+    this.directory.set(key, { rowid });
     this.liveCount++;
     if (rowid + 1 > this.capacity) {  // equiv: 容量只影响位图分配，多长一档无副作用
       this.capacity = Math.max(this.capacity * 2, rowid + 1);
       // 位图自己是稀疏的（越界写会 _ensure 扩容），这里不需要主动迁移
     }
     return rowid;
+  }
+
+  private _ensureEnumCapacity(col: EnumCol, need: number): void {
+    if (col.rows.length >= need) return;
+    let n = col.rows.length;
+    while (n < need) n *= 2;
+    const next = new Uint32Array(n);
+    next.set(col.rows);
+    col.rows = next;
   }
 
   private _ensureNumCapacity(col: NumCol, need: number): void {
@@ -440,7 +501,9 @@ export class BizIndex {
 
   private _clearBits(rowid: number): void {
     for (const col of Object.values(this.enums)) {
-      for (const bm of col.bitmaps.values()) bm.clear(rowid);
+      const id = col.rows[rowid] ?? 0;
+      if (id > 0) col.bitmaps.get(col.values[id - 1]!)?.clear(rowid); // equiv: id=0 时 values[-1] 为 undefined，可选链同样无操作
+      col.rows[rowid] = 0;
     }
   }
 
@@ -454,15 +517,15 @@ export class BizIndex {
 
   /** 快照用：rowid → key（只吐存活的） */
   *snapshotRows(): Generator<readonly [number, string]> {
-    for (let r = 0; r < this.keys.length; r++) { // equiv: 越界一位时 alive.get 返回 false
-      if (!this.alive.get(r)) continue;
-      yield [r, this.keys[r]!];
+    for (const [key, rec] of this.directory.entries()) {
+      if (this.alive.get(rec.rowid!)) yield [rec.rowid!, key];
     }
   }
 
-  snapshotEnums(): Array<{ field: string; values: Array<{ value: string; bitmap: Bitmap }> }> {
+  snapshotEnums(): Array<{ field: string; rows: Uint32Array; values: Array<{ value: string; bitmap: Bitmap }> }> {
     return Object.entries(this.enums).map(([field, col]) => ({
       field,
+      rows: col.rows,
       values: [...col.bitmaps].map(([value, bitmap]) => ({ value, bitmap })),
     }));
   }
@@ -492,29 +555,40 @@ export class BizIndex {
    */
   restoreSnapshot(s: {
     keys: readonly (string | undefined)[];
-    enums: Array<{ field: string; values: Array<{ value: string; bitmap: Bitmap }> }>;
+    enums: Array<{ field: string; rows?: Uint32Array; values: Array<{ value: string; bitmap: Bitmap }> }>;
     nums: Array<{ field: string; data: Float64Array; bmin?: Float64Array; bmax?: Float64Array }>;
     alive: Bitmap;
     state: { nextRowid: number; liveCount: number; capacity: number };
-  }): void {
-    this.rowids.clear();
-    this.keys = [];
+  }, restoreKeys = true, clearDirectory = true): void {
+    if (restoreKeys && clearDirectory) this.directory.clear();
     this.enums = {};
     this.nums = {};
     this.alive = s.alive;
     this.capacity = s.state.capacity;
     this.nextRowid = s.state.nextRowid;
     this.liveCount = s.state.liveCount;
-    for (let r = 0; r < s.keys.length; r++) { // equiv: 越界一位时 s.keys[r] 是 undefined，被 continue 跳过
-      const k = s.keys[r];
-      if (k === undefined) continue;
-      this.keys[r] = k;
-      this.rowids.set(k, r);
+    if (restoreKeys) {
+      for (let r = 0; r < s.keys.length; r++) { // equiv: 越界一位时 s.keys[r] 是 undefined，被 continue 跳过
+        const k = s.keys[r];
+        if (k === undefined) continue;
+        this.directory.set(k, { rowid: r });
+      }
     }
     for (const col of s.enums) {
-      const bitmaps = new Map<string, Bitmap>();
-      for (const v of col.values) bitmaps.set(v.value, v.bitmap);
-      this.enums[col.field] = { kind: 'enum', bitmaps };
+      const enumCol = BizIndex._newEnumCol(this.capacity);
+      if (col.rows) enumCol.rows = col.rows;
+      for (const v of col.values) {
+        const id = enumCol.values.length + 1;
+        enumCol.ids.set(v.value, id);
+        enumCol.values.push(v.value);
+        enumCol.bitmaps.set(v.value, v.bitmap);
+        if (!col.rows) {
+          v.bitmap.forEach((rowid) => {
+            if (rowid < enumCol.rows.length) enumCol.rows[rowid] = id; // equiv: 等于 length 时 TypedArray 越界写同样被忽略
+          });
+        }
+      }
+      this.enums[col.field] = enumCol;
     }
     for (const col of s.nums) {
       const numCol: NumCol = {
