@@ -34,11 +34,19 @@ const STATUS = ['active', 'leave', 'gone'];
 
 const canGC = typeof (globalThis as { gc?: () => void }).gc === 'function';
 
-/** 强制 GC 后取内存。没有 --expose-gc 时退化为直接读，但要标记不可信。 */
-const mem = (): { heap: number; rss: number } => {
+/**
+ * 强制 GC 后取内存。没有 --expose-gc 时退化为直接读，但要标记不可信。
+ *
+ * 三个口径必须分开看，混在一起会得出荒谬结论（踩过）：
+ *   - heapUsed：JS 堆对象（Map/string/普通数组）。key 映射落盘后这里只剩稀疏索引。
+ *   - external：TypedArray（Float64Array/Uint32Array）的底层 buffer。数值列与位图
+ *     都在这，heapUsed 看不见它们——只看 heapUsed 会误报「索引内存 0GB」。
+ *   - rss：进程真实驻留内存（含文件页缓存），是「这台机器到底要吃多少」的最终答案。
+ */
+const mem = (): { heap: number; external: number; rss: number } => {
   if (canGC) (globalThis as { gc?: () => void }).gc!();
   const m = process.memoryUsage();
-  return { heap: m.heapUsed, rss: m.rss };
+  return { heap: m.heapUsed, external: m.external, rss: m.rss };
 };
 
 const MB = 1048576;
@@ -97,6 +105,7 @@ interface OpenRun {
   path: string;
   note: string;
   heap: number;
+  external: number;
   rss: number;
 }
 const openOnce = async (snapshot: boolean): Promise<OpenRun> => {
@@ -109,6 +118,7 @@ const openOnce = async (snapshot: boolean): Promise<OpenRun> => {
     path: s.openPath,
     note: st.snapshot.note,
     heap: after.heap - before.heap,
+    external: after.external - before.external,
     rss: after.rss - before.rss,
   };
   await s.close();
@@ -129,6 +139,8 @@ for (let r = 0; r < 3; r++) {
 const snapMs = pct(snaps.map((x) => x.ms), 50);
 const replayMs = pct(replays.map((x) => x.ms), 50);
 const snapHeap = pct(snaps.map((x) => x.heap), 50);
+const snapExternal = pct(snaps.map((x) => x.external), 50);
+const snapRss = pct(snaps.map((x) => x.rss), 50);
 
 // ---- 查询（逐条计时太长，按批计时再折算）----
 const q = Store.open(file);
@@ -158,7 +170,7 @@ const qStats = FILTERS.map((f) => {
 const idxRows = (() => {
   // 索引本身在 open 时已经建好，这里只记一下位图/枚举的规模，方便对照
   const st = q.bizStats();
-  return { bitmaps: st.index.bitmaps, rows: st.index.rows };
+  return { bitmaps: st.index.bitmaps, rows: st.index.rows, nums: st.index.nums.length };
 })();
 await q.close();
 
@@ -166,7 +178,13 @@ await q.close();
 const GB = 1024 * MB;
 const rowsAt10G = (TARGET_GB * GB) / bytesPerRow;
 const heapPerRow = Math.max(0, snapHeap) / ROWS;
+const externalPerRow = Math.max(0, snapExternal) / ROWS;
+// 数值列/位图的内存是结构确定的，不必依赖 external 测量（external 里混着 transient
+// 快照 buffer，实测会高估数倍）：数值列每列 Float64Array = 8 B/行，位图每张 1 bit/行。
+const structPerRow = idxRows.nums * 8 + idxRows.bitmaps / 8;
 const memAt10G = (rowsAt10G * heapPerRow) / GB;
+const externalAt10G = (rowsAt10G * externalPerRow) / GB;
+const structAt10G = (rowsAt10G * structPerRow) / GB;
 const openAt10G = (rowsAt10G * snapMs) / ROWS / 1000;
 
 if (JSON_OUT) {
@@ -181,9 +199,15 @@ if (JSON_OUT) {
         snapMs,
         replayMs,
         snapHeap,
+        snapExternal,
+        snapRss,
         heapPerRow,
+        externalPerRow,
+        structPerRow,
         rowsAt10G,
         memAt10G,
+        externalAt10G,
+        structAt10G,
         openAt10G,
         queries: qStats,
         idxRows,
@@ -201,7 +225,7 @@ if (JSON_OUT) {
   console.log(`close（含写快照）    ${closeMs.toFixed(0)}ms`);
   console.log(`文件                ${(bytes / MB).toFixed(1)}MB  ${bytesPerRow.toFixed(1)} 字节/行`);
   console.log('');
-  console.log(`open 快照           ${snapMs.toFixed(1)}ms   +heap ${(snapHeap / MB).toFixed(1)}MB`);
+  console.log(`open 快照           ${snapMs.toFixed(1)}ms   +heap ${(snapHeap / MB).toFixed(1)}MB  +external ${(snapExternal / MB).toFixed(1)}MB  +rss ${(snapRss / MB).toFixed(1)}MB`);
   console.log(`open 重放           ${replayMs.toFixed(1)}ms   ${replays[0]!.path}`);
   console.log(`加速                ${(replayMs / snapMs).toFixed(1)}×`);
   console.log('');
@@ -209,12 +233,14 @@ if (JSON_OUT) {
     console.log(`查询 ${s.label.padEnd(52)} p50=${s.p50.toFixed(1)}ms p99=${s.p99.toFixed(1)}ms  命中 ${s.matched}`);
   }
   console.log('');
-  console.log(`每行索引成本        ${heapPerRow.toFixed(1)} 字节/行  ${canGC ? '' : '（无 gc，含垃圾，不可信）'}`);
+  console.log(`每行成本·key 映射(heap)    ${heapPerRow.toFixed(1)} B/行  ${canGC ? '' : '（无 gc，含垃圾，不可信）'}`);
+  console.log(`每行成本·数值列/位图(结构) ${structPerRow.toFixed(1)} B/行（${idxRows.nums} 数值列×8B + ${idxRows.bitmaps} 位图×1bit）`);
   console.log(`位图规模            ${idxRows.bitmaps} 个位图 / ${idxRows.rows} 行`);
   console.log('');
   console.log(`=== 外推到 ${TARGET_GB}GB ===`);
   console.log(`行数                ${Math.round(rowsAt10G).toLocaleString()}`);
-  console.log(`索引内存            ${(memAt10G / 1024).toFixed(1)}GB`);
+  console.log(`key 映射内存(heap)  ${memAt10G.toFixed(2)}GB`);
+  console.log(`数值列/位图(结构)   ${structAt10G.toFixed(2)}GB`);
   console.log(`冷启动（线性外推）  ${openAt10G.toFixed(1)}s`);
 }
 
